@@ -1,0 +1,243 @@
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index cca843d5bf..37f22822c6 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -78,6 +78,7 @@ import {
+ import { notifyError } from '@/store/notifications'
+ import {
+   $newChatProfile,
++  $newChatRoute,
+   $profileColors,
+   $profiles,
+   $profileScope,
+@@ -1636,7 +1637,14 @@ export function ChatSidebar({
+                       // no swap. The switcher header is the single place to
+                       // change which profile that is.
+                       if (isNewSession) {
++                        // A plain new session targets the live gateway
++                        // context: drop the profile intent AND any explicit
++                        // owner pin — the pin outranks the active connection
++                        // in resolveNewChatOwnerRoute, so a stale one from a
++                        // prior action would route this chat (and the window)
++                        // to its old gateway.
+                         $newChatProfile.set(null)
++                        $newChatRoute.set(null)
+                       }
+ 
+                       if (item.keybindActionId) {
+@@ -1661,6 +1669,7 @@ export function ChatSidebar({
+ 
+                       startNewSessionDrag(placement => {
+                         $newChatProfile.set(null)
++                        $newChatRoute.set(null)
+                         onNewSessionSplit(placement.dir, { anchor: placement.anchor, before: placement.before })
+                       }, event)
+                     }}
+diff --git a/apps/desktop/src/app/hooks/use-keybinds.ts b/apps/desktop/src/app/hooks/use-keybinds.ts
+index 622eea911f..658a96a8e1 100644
+--- a/apps/desktop/src/app/hooks/use-keybinds.ts
++++ b/apps/desktop/src/app/hooks/use-keybinds.ts
+@@ -53,6 +53,7 @@ import { notifyError } from '@/store/notifications'
+ import { toggleBrowserTab } from '@/store/preview'
+ import {
+   $newChatProfile,
++  $newChatRoute,
+   cycleProfile,
+   requestProfileCreate,
+   switchProfileToSlot,
+@@ -309,9 +310,12 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
+     'session.new': () => {
+       // Match the sidebar New Session button. A plain keyboard new chat should
+       // target the current live profile, not a stale per-profile quick-create
+-      // selection from a prior action.
++      // selection — or an explicit owner pin — from a prior action. The pin
++      // outranks the active connection in resolveNewChatOwnerRoute, so it must
++      // be dropped alongside the profile intent.
+       setWorkspaceScope('sessions')
+       $newChatProfile.set(null)
++      $newChatRoute.set(null)
+       deps.startFreshSession()
+       window.dispatchEvent(new CustomEvent('hermes:new-session-shortcut'))
+     },
+diff --git a/apps/desktop/src/app/session/hooks/default-new-session.test.tsx b/apps/desktop/src/app/session/hooks/default-new-session.test.tsx
+index 34524b1068..41cf52359f 100644
+--- a/apps/desktop/src/app/session/hooks/default-new-session.test.tsx
++++ b/apps/desktop/src/app/session/hooks/default-new-session.test.tsx
+@@ -305,4 +305,51 @@ describe('generic new session default routing', () => {
+     })
+     expect(requestGateway).not.toHaveBeenCalled()
+   })
++
++  it('drops a stale explicit owner pin instead of following it (plain new session)', async () => {
++    // An old per-agent pin (e.g. a sidebar gateway-group "+" or an earlier
++    // target) must not hijack a plain New Session: the pin outranks the
++    // active connection in resolveNewChatOwnerRoute unless the generic flow
++    // drops it alongside the profile intent.
++    $newChatRoute.set({ connectionId: 'stale-host', profile: 'stale' })
++    $newChatProfile.set('stale')
++    $newChatConnectionId.set('stale-host')
++    const { result } = mountActions()
++
++    act(() => result.current.selectSidebarItem({ action: 'new-session' } as never))
++    expect($newChatRoute.get()).toBeNull()
++    expect($newChatProfile.get()).toBeNull()
++
++    await act(() => result.current.createBackendSessionForSend())
++
++    expect(requestGatewayForAgent).toHaveBeenCalledWith(
++      'previous',
++      'other',
++      'session.create',
++      expect.objectContaining({ profile: 'other' }),
++      ...FOREGROUND_CREATE_DIAL
++    )
++    expect(getSessionOwnerHint('created-stored')).toEqual({ connectionId: 'previous', profile: 'other' })
++  })
++
++  it('still honors the saved default after dropping a stale pin', async () => {
++    $newChatRoute.set({ connectionId: 'stale-host', profile: 'stale' })
++    $newChatProfile.set('stale')
++    $newChatConnectionId.set('stale-host')
++    const { result } = mountActions()
++    await act(() => setDefaultProfile({ connectionId: 'lab', profile: 'research' }))
++
++    act(() => result.current.selectSidebarItem({ action: 'new-session' } as never))
++    expect($newChatRoute.get()).toEqual({ connectionId: 'lab', profile: 'research' })
++
++    await act(() => result.current.createBackendSessionForSend())
++    expect(requestGatewayForAgent).toHaveBeenCalledWith(
++      'lab',
++      'research',
++      'session.create',
++      expect.objectContaining({ profile: 'research' }),
++      ...FOREGROUND_CREATE_DIAL
++    )
++    expect(getSessionOwnerHint('created-stored')).toEqual({ connectionId: 'lab', profile: 'research' })
++  })
+ })
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index b631e36ba8..ae1b484d2b 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -51,6 +51,7 @@ import {
+   $activeGatewayProfile,
+   $gatewaySwapTarget,
+   $newChatProfile,
++  $newChatRoute,
+   $profiles,
+   $showAllProfiles,
+   type AgentProfileRoute,
+@@ -839,6 +840,14 @@ export function useSessionActions({
+   const selectSidebarItem = useCallback(
+     (item: SidebarNavItem) => {
+       if (item.action === 'new-session') {
++        // Drop any stale explicit owner pin and profile intent BEFORE
++        // consulting the saved default: a plain new session lands in the live
++        // gateway context unless an explicit default or window override
++        // re-pins it just below. The stale pin would otherwise outrank the
++        // active connection in resolveNewChatOwnerRoute and route the chat
++        // to its old gateway.
++        $newChatRoute.set(null)
++        $newChatProfile.set(null)
+         prepareDefaultNewSession()
+         setWorkspaceScope('sessions')
+         startFreshSessionDraft()
+diff --git a/apps/desktop/src/store/connections.test.ts b/apps/desktop/src/store/connections.test.ts
+index 496c9d0fa6..954c3588db 100644
+--- a/apps/desktop/src/store/connections.test.ts
++++ b/apps/desktop/src/store/connections.test.ts
+@@ -9,6 +9,7 @@ import { deferred } from '../test/deferred'
+ 
+ const $activeGatewayProfile = atom('default')
+ const $newChatProfile = atom<null | string>(null)
++const $newChatRoute = atom<null | { connectionId: string; profile: string }>(null)
+ const $freshSessionRequest = atom(0)
+ const $showAllProfiles = atom(false)
+ 
+@@ -73,6 +74,7 @@ vi.mock('@/store/profile', () => ({
+   $activeGatewayProfile,
+   $freshSessionRequest,
+   $newChatProfile,
++  $newChatRoute,
+   $showAllProfiles,
+   captureNewChatSource: vi.fn(),
+   ensureGatewayAgent,
+@@ -286,6 +288,30 @@ describe('selectConnection', () => {
+     expect(setLastUsed).toHaveBeenCalledWith('homelab')
+   })
+ 
++  // Carried fix (pending upstream): an explicit agent pin captured on another
++  // source must not outrank the source a switch lands on — without the clear,
++  // the next generic New Session resolves back to the old source and re-homes
++  // the window to it.
++  it('drops an explicit new-chat pin on a source switch so the next generic draft follows the new source', async () => {
++    setConnectionsRegistry(registry)
++    $connection.set({ connectionId: 'local', mode: 'local' })
++    $newChatRoute.set({ connectionId: 'local', profile: 'default' })
++
++    await selectConnection('homelab')
++
++    expect($newChatRoute.get()).toBeNull()
++  })
++
++  it('also clears an explicit new-chat pin when the current source is selected again', async () => {
++    setConnectionsRegistry(registry)
++    $connection.set({ connectionId: 'local', mode: 'local' })
++    $newChatRoute.set({ connectionId: 'homelab', profile: 'default' })
++
++    await selectConnection('local')
++
++    expect($newChatRoute.get()).toBeNull()
++  })
++
+   it('does not reset or dial when the active source/profile is selected again', async () => {
+     setConnectionsRegistry(registry)
+     $connection.set({ connectionId: 'local', mode: 'local' })
+diff --git a/apps/desktop/src/store/connections.ts b/apps/desktop/src/store/connections.ts
+index 0462e1d1bf..8c42089b8d 100644
+--- a/apps/desktop/src/store/connections.ts
++++ b/apps/desktop/src/store/connections.ts
+@@ -22,6 +22,7 @@ import {
+   $activeGatewayProfile,
+   $freshSessionRequest,
+   $newChatProfile,
++  $newChatRoute,
+   $showAllProfiles,
+   captureNewChatSource,
+   ensureGatewayAgent,
+@@ -389,6 +390,11 @@ export async function selectConnection(connectionId: string, options: SelectConn
+     currentProfile !== targetProfile
+ 
+   if (!switching) {
++    // A switcher click is an explicit statement that the next chat starts on
++    // this source. Drop any explicit agent pin captured elsewhere (carried
++    // fix, pending upstream) — otherwise the next generic New Session still
++    // resolves back to that other source even though this click said "here".
++    $newChatRoute.set(null)
+     await rememberConnection(connectionId)
+ 
+     return
+@@ -401,6 +407,12 @@ export async function selectConnection(connectionId: string, options: SelectConn
+     // registry identity with the profile so the next create names local::x /
+     // <source>::x exactly, never a bare profile string.
+     captureNewChatSource()
++    // Carried fix (pending upstream): an explicit agent pin ($newChatRoute,
++    // set by a gateway group's "+" or a default-target prep) outranks the
++    // window's active connection in resolveNewChatOwnerRoute — so without
++    // dropping it here, the next generic New Session would resolve back to
++    // the source this window just left and re-home the window to it.
++    $newChatRoute.set(null)
+     requestFreshSession()
+     await rememberConnection(connectionId)
+ 
+@@ -533,7 +545,10 @@ export async function selectConnection(connectionId: string, options: SelectConn
+       }
+ 
+       $newChatProfile.set(targetProfile)
++      // Carried fix (pending upstream): see the same-source path above — an
++      // explicit agent pin must not outrank the source this switch lands on.
+       captureNewChatSource()
++      $newChatRoute.set(null)
+       requestFreshSession()
+       await refreshActiveProfile()
+     }
