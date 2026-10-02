@@ -1,0 +1,228 @@
+diff --git a/apps/desktop/electron/notification-ipc.test.ts b/apps/desktop/electron/notification-ipc.test.ts
+index e695a1741f..f0703a539e 100644
+--- a/apps/desktop/electron/notification-ipc.test.ts
++++ b/apps/desktop/electron/notification-ipc.test.ts
+@@ -8,17 +8,26 @@ import type { HermesNotification } from './notification-types'
+ const host = vi.hoisted(() => ({
+   handle: vi.fn(),
+   fromWebContents: vi.fn(),
+-  shown: [] as EventEmitter[]
++  shown: [] as Array<EventEmitter & { options?: Record<string, unknown>; close: ReturnType<typeof vi.fn> }>
+ }))
+ 
+ vi.mock('electron', () => ({
+   BrowserWindow: { fromWebContents: host.fromWebContents },
+   ipcMain: { handle: host.handle },
+   Notification: class extends EventEmitter {
++    options: Record<string, unknown>
++
++    constructor(options: Record<string, unknown>) {
++      super()
++      this.options = options
++    }
++
+     static isSupported() {
+       return true
+     }
+ 
++    close = vi.fn()
++
+     show() {
+       host.shown.push(this)
+     }
+@@ -30,7 +39,7 @@ import { registerNativeNotifications } from './notification-ipc'
+ function windowStub() {
+   return {
+     isDestroyed: vi.fn(() => false),
+-    webContents: { isDestroyed: vi.fn(() => false), send: vi.fn() }
++    webContents: Object.assign(new EventEmitter(), { isDestroyed: vi.fn(() => false), send: vi.fn() })
+   }
+ }
+ 
+@@ -40,6 +49,45 @@ beforeEach(() => {
+   host.shown.length = 0
+ })
+ 
++it('keeps approval toasts persistent on Windows only', () => {
++  const source = windowStub()
++  host.fromWebContents.mockReturnValue(source)
++  registerNativeNotifications({ getMainWindow: () => source as unknown as BrowserWindow, focusWindow: vi.fn() })
++  const notify = host.handle.mock.calls[0][1] as (event: IpcMainInvokeEvent, payload: HermesNotification) => boolean
++  const event = { sender: source.webContents } as unknown as IpcMainInvokeEvent
++
++  notify(event, { kind: 'approval', sessionId: 'approval-session', title: 'Approval' })
++  notify(event, { kind: 'turnDone', sessionId: 'turn-session', title: 'Done' })
++  notify(event, { kind: 'turnDone', persistent: true, tag: 'test-1', title: 'Test' })
++
++  expect(host.shown[0]?.options?.timeoutType).toBe(process.platform === 'win32' ? 'never' : undefined)
++  expect(host.shown[1]?.options?.timeoutType).toBeUndefined()
++  expect(host.shown[2]?.options?.timeoutType).toBe(process.platform === 'win32' ? 'never' : undefined)
++})
++
++it('closes only the exact request owned by the requesting renderer', () => {
++  const source = windowStub()
++  const other = windowStub()
++  host.fromWebContents.mockReturnValue(source)
++  registerNativeNotifications({ getMainWindow: () => source as unknown as BrowserWindow, focusWindow: vi.fn() })
++  const notify = host.handle.mock.calls.find(([name]) => name === 'hermes:notify')![1]
++  const event = { sender: source.webContents }
++  notify(event, { kind: 'approval', requestId: 'old', sessionId: 'session' })
++  notify(event, { kind: 'approval', requestId: 'new', sessionId: 'session' })
++  const dismiss = host.handle.mock.calls.find(([name]) => name === 'hermes:notify-dismiss')?.[1]
++  expect(dismiss).toBeTypeOf('function')
++  dismiss({ sender: other.webContents }, 'old')
++  expect(host.shown[0].close).not.toHaveBeenCalled()
++  dismiss(event, 'old')
++  expect(host.shown[0].close).toHaveBeenCalledOnce()
++  expect(host.shown[1].close).not.toHaveBeenCalled()
++  // Even a queued native action on a retired toast cannot act on the new prompt.
++  host.shown[0].emit('action', {}, 0)
++  expect(source.webContents.send).not.toHaveBeenCalled()
++  source.webContents.emit('destroyed')
++  expect(host.shown[1].close).toHaveBeenCalledOnce()
++})
++
+ it('returns native clicks and approval actions to the emitting window, not the primary', async () => {
+   const primary = windowStub()
+   const source = windowStub()
+diff --git a/apps/desktop/electron/notification-ipc.ts b/apps/desktop/electron/notification-ipc.ts
+index 2c784ec2a2..f56eb741de 100644
+--- a/apps/desktop/electron/notification-ipc.ts
++++ b/apps/desktop/electron/notification-ipc.ts
+@@ -22,6 +22,7 @@ export function registerNativeNotifications({
+   const deliveries = new Map<string, Promise<boolean>>()
+   const linux = platform === 'linux' ? createLinuxNotifications() : undefined
+   const notifications = createNotificationRegistry({ releaseOnClose: Boolean(linux) })
++  const pending = new WeakMap<Electron.WebContents, Map<string, () => void>>()
+ 
+   ipcMain.handle('hermes:notify', async (event, payload: HermesNotification) => {
+     // The source renderer owns runtime bindings and plugin callbacks.
+@@ -35,10 +36,25 @@ export function registerNativeNotifications({
+     // Peer renderers share one OS notification for the same event.
+     const key = `${payload?.kind ?? ''}:${payload?.sessionId ?? payload?.tag ?? ''}`
+ 
+-    if (isDuplicateNotification(key)) {
++    // Request notifications are owned by one renderer and one exact request;
++    // unrelated requests in the same session must never collapse together.
++    const requestId =
++      payload?.kind === 'approval' && typeof payload.requestId === 'string' ? payload.requestId : undefined
++
++    const owned = pending.get(event.sender) ?? new Map<string, () => void>()
++
++    if (requestId) {
++      if (owned.has(requestId)) {
++        return true
++      }
++
++      pending.set(event.sender, owned)
++    } else if (isDuplicateNotification(key)) {
+       return deliveries.get(key) ?? false
+     }
+ 
++    let retired = false
++
+     const actions = Array.isArray(payload?.actions) ? payload.actions : []
+     const icon = typeof payload?.icon === 'string' && payload.icon.trim() ? payload.icon.trim() : undefined
+ 
+@@ -47,11 +63,25 @@ export function registerNativeNotifications({
+       body: payload?.body || '',
+       silent: Boolean(payload?.silent),
+       ...(icon ? { icon } : {}),
++      // Blocking work (approvals) and explicit persistent sends (settings test)
++      // stay visible on Windows until acted on instead of banner-timeout hiding.
++      ...(platform === 'win32' && (payload?.kind === 'approval' || payload?.persistent === true)
++        ? { timeoutType: 'never' as const }
++        : {}),
+       actions: actions.map(action => ({ type: 'button' as const, text: String(action?.text || '') }))
+     }
+ 
+     const notification = linux ? linux.create(options) : new Notification(options)
+ 
++    if (requestId) {
++      notification.on('show', () =>
++        console.info('[approval-notification]', JSON.stringify({ requestId, outcome: 'native-shown' }))
++      )
++      notification.on('failed', () =>
++        console.warn('[approval-notification]', JSON.stringify({ requestId, outcome: 'native-failed' }))
++      )
++    }
++
+     notification.on('click', () => {
+       const window = targetWindow()
+ 
+@@ -76,6 +106,10 @@ export function registerNativeNotifications({
+       }
+     })
+     notification.on('action', (actionEvent, index) => {
++      if (retired) {
++        return
++      }
++
+       const window = targetWindow()
+ 
+       if (!window || window.isDestroyed()) {
+@@ -94,7 +128,11 @@ export function registerNativeNotifications({
+           return
+         }
+ 
+-        window.webContents.send('hermes:notification-action', { sessionId: payload.sessionId, actionId: action.id })
++        window.webContents.send('hermes:notification-action', {
++          sessionId: payload.sessionId,
++          actionId: action.id,
++          ...(requestId ? { requestId } : {})
++        })
+ 
+         return
+       }
+@@ -107,7 +145,33 @@ export function registerNativeNotifications({
+         tag: payload?.tag
+       })
+     })
+-    notifications.retain(notification)
++    const dismiss = notifications.retain(notification, { requestOwned: Boolean(requestId) })
++
++    if (requestId) {
++      const clean = () => {
++        retired = true
++        owned.delete(requestId)
++        event.sender.removeListener('destroyed', close)
++        event.sender.removeListener('render-process-gone', close)
++        event.sender.removeListener('did-start-loading', close)
++        notification.removeListener('click', clean)
++        notification.removeListener('action', clean)
++        notification.removeListener('failed', clean)
++      }
++
++      const close = () => {
++        dismiss()
++        clean()
++      }
++
++      owned.set(requestId, close)
++      event.sender.once('destroyed', close)
++      event.sender.once('render-process-gone', close)
++      event.sender.once('did-start-loading', close)
++      notification.once('click', clean)
++      notification.once('action', clean)
++      notification.once('failed', clean)
++    }
+ 
+     // Peers share the actual outcome, including pending/failed Linux delivery.
+     const delivery = Promise.resolve(notification.show()).then(result => result !== false)
+@@ -121,5 +185,16 @@ export function registerNativeNotifications({
+     return delivery
+   })
+ 
++  ipcMain.handle('hermes:notify-dismiss', (event, requestId: unknown) => {
++    if (typeof requestId !== 'string') {
++      return false
++    }
++
++    const dismiss = pending.get(event.sender)?.get(requestId)
++    dismiss?.()
++
++    return Boolean(dismiss)
++  })
++
+   return { dispose: () => linux?.dispose() }
+ }
