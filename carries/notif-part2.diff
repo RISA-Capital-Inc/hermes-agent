@@ -1,0 +1,282 @@
+diff --git a/apps/desktop/electron/notification-registry.test.ts b/apps/desktop/electron/notification-registry.test.ts
+index 9478701d2a..c6128dfdd5 100644
+--- a/apps/desktop/electron/notification-registry.test.ts
++++ b/apps/desktop/electron/notification-registry.test.ts
+@@ -6,6 +6,22 @@ import { createNotificationRegistry } from './notification-registry'
+ 
+ afterEach(() => vi.useRealTimers())
+ 
++it('keeps request-owned notifications until their request retires, not the generic TTL', () => {
++  vi.useFakeTimers()
++  const registry = createNotificationRegistry({ ttlMs: 1000 })
++  const notification = Object.assign(new EventEmitter(), { close: vi.fn() })
++  const dismiss = registry.retain(notification, { requestOwned: true })
++  vi.advanceTimersByTime(300_000)
++  expect(notification.close).not.toHaveBeenCalled()
++  expect(registry.has(notification)).toBe(true)
++  dismiss()
++  expect(notification.close).toHaveBeenCalledOnce()
++  expect(registry.has(notification)).toBe(false)
++  dismiss()
++  expect(notification.close).toHaveBeenCalledOnce()
++  expect(vi.getTimerCount()).toBe(0)
++})
++
+ it('retains a dismissed banner until its later click or action is consumed', () => {
+   vi.useFakeTimers()
+   const registry = createNotificationRegistry()
+diff --git a/apps/desktop/electron/notification-registry.ts b/apps/desktop/electron/notification-registry.ts
+index 3905cbf3e4..3823fbc5fa 100644
+--- a/apps/desktop/electron/notification-registry.ts
++++ b/apps/desktop/electron/notification-registry.ts
+@@ -13,8 +13,9 @@ export function createNotificationRegistry({ ttlMs = NOTIFICATION_RETENTION_TTL_
+   const live = new Set<RetainedNotification>()
+   const releaseEvents = releaseOnClose ? [...RELEASE_EVENTS, 'close'] : RELEASE_EVENTS
+ 
+-  function retain(notification: RetainedNotification): void {
++  function retain(notification: RetainedNotification, { requestOwned = false } = {}): () => void {
+     live.add(notification)
++    let timer: ReturnType<typeof setTimeout> | undefined
+ 
+     const release = () => {
+       clearTimeout(timer)
+@@ -29,13 +30,20 @@ export function createNotificationRegistry({ ttlMs = NOTIFICATION_RETENTION_TTL_
+       notification.on(event, release)
+     }
+ 
+-    // Bound retention without leaving an OS notification whose handler is gone.
+-    const timer = setTimeout(() => {
++    const dismiss = () => {
++      if (!live.has(notification)) {return}
+       notification.close()
+       release()
+-    }, ttlMs)
++    }
++
++    // Request-owned notifications follow the backend lifecycle instead of an
++    // unrelated retention limit. The owning renderer must dismiss on retirement.
++    if (!requestOwned) {
++      timer = setTimeout(dismiss, ttlMs)
++      timer.unref()
++    }
+ 
+-    timer.unref()
++    return dismiss
+   }
+ 
+   return { retain, has: (notification: RetainedNotification) => live.has(notification) }
+diff --git a/apps/desktop/electron/notification-types.ts b/apps/desktop/electron/notification-types.ts
+index 242f2edc18..220d9c2de7 100644
+--- a/apps/desktop/electron/notification-types.ts
++++ b/apps/desktop/electron/notification-types.ts
+@@ -3,6 +3,10 @@ export interface HermesNotification {
+   body?: string
+   silent?: boolean
+   kind?: string
++  /** Exact live server request owning an approval notification. */
++  requestId?: string
++  /** Keep the toast visible until acted on (Windows `timeoutType: never`): approvals, and explicit sends like the settings test button. */
++  persistent?: boolean
+   sessionId?: string
+   /** Durable click target captured before runtime bindings can be recycled. */
+   focusSessionId?: string
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index 23948840b2..dbf5f6982c 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -340,6 +340,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+   api: request => ipcRenderer.invoke('hermes:api', request).then(unwrapExpectedNotFound),
+   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
+   claimStartupLatency: () => ipcRenderer.invoke('hermes:startup-latency:claim'),
++  dismissNotification: requestId => ipcRenderer.invoke('hermes:notify-dismiss', requestId),
+   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
+   readWindowBelow: () => ipcRenderer.invoke('hermes:window:readBelow'),
+   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),
+diff --git a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+index 9237c642d5..9f1298dd0a 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+@@ -333,8 +333,8 @@ export function useDesktopIntegrations({
+   }, [locationPathname, navigate, runtimeIdByStoredSessionId])
+ 
+   useEffect(() => {
+-    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
+-      void respondToApprovalAction(sessionId ?? null, actionId)
++    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId, requestId }) => {
++      void respondToApprovalAction(sessionId ?? null, actionId, requestId)
+     })
+ 
+     return () => unsubscribe?.()
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/input-requests.approval-timeout.test.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/input-requests.approval-timeout.test.ts
+index 65e5b2a6e9..9f9807d41f 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/input-requests.approval-timeout.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/input-requests.approval-timeout.test.ts
+@@ -1,8 +1,10 @@
++import type { ServerRequest } from '@hermes/shared'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { $notifications, clearNotifications } from '@/store/notifications'
+ import { $approvalRequests, clearApprovalRequest, setApprovalRequest } from '@/store/prompts'
+ import { $routeRequest } from '@/store/recovery-requests'
++import { rememberServerRequest, resetServerRequestsForTests } from '@/store/server-requests'
+ 
+ import { handleInputRequestEvent } from './input-requests'
+ import type { GatewayEventContext } from './types'
+@@ -38,6 +40,35 @@ function parkApproval() {
+ }
+ 
+ describe('approval request.cancel', () => {
++  it.each(['timeout', 'answered', 'interrupted', 'shutdown'])(
++    'dismisses the native toast on backend retirement: %s',
++    reason => {
++      const original = window.hermesDesktop
++      const dismissNotification = vi.fn().mockResolvedValue(true)
++      window.hermesDesktop = { dismissNotification } as unknown as Window['hermesDesktop']
++      vi.useFakeTimers()
++
++      try {
++        parkApproval()
++        rememberServerRequest({
++          id: 'srv-1',
++          method: 'approval',
++          params: {},
++          respond: vi.fn()
++        } as unknown as ServerRequest)
++        vi.advanceTimersByTime(299_999)
++        expect(dismissNotification).not.toHaveBeenCalled()
++        vi.advanceTimersByTime(1)
++        handleInputRequestEvent(context(reason, vi.fn()))
++        expect(dismissNotification).toHaveBeenCalledExactlyOnceWith('srv-1')
++        expect($approvalRequests.get()['s1']).toBeUndefined()
++      } finally {
++        window.hermesDesktop = original
++        resetServerRequestsForTests()
++        vi.useRealTimers()
++      }
++    }
++  )
+   afterEach(() => {
+     clearApprovalRequest('s1')
+     clearNotifications()
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+index f4b03917fb..a41c67a029 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+@@ -1,8 +1,11 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { createClientSessionState } from '@/lib/chat-runtime'
++import { setNativeNotifyEnabled, setNativeNotifyKind } from '@/store/native-notifications'
++import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from '@/store/notify-baseline'
++import { clearApprovalRequest } from '@/store/prompts'
+ import { hasOpenServerRequest, resetServerRequestsForTests } from '@/store/server-requests'
+-import { setActiveSessionId, setSelectedStoredSessionId, setSessions } from '@/store/session'
++import { $activeSessionId, setActiveSessionId, setSelectedStoredSessionId, setSessions } from '@/store/session'
+ import { $sessionStates, $sessionTiles } from '@/store/session-states'
+ import { $toursEnabled } from '@/store/tours'
+ import type { SessionInfo } from '@/types/hermes'
+@@ -44,6 +47,59 @@ function deliver(method: string, params: Record<string, unknown>, activeSessionI
+   return { decline, fail, handled, respond }
+ }
+ 
++describe('approval notification routing', () => {
++  it('delivers a new background-tab approval through the native bridge during reconnect, but not its replay', () => {
++    const original = window.hermesDesktop
++    const previousSession = $activeSessionId.get()
++    const notify = vi.fn().mockResolvedValue(true)
++    window.hermesDesktop = { notify } as unknown as Window['hermesDesktop']
++    vi.spyOn(document, 'hasFocus').mockReturnValue(true)
++    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
++    setNativeNotifyEnabled(true)
++    setNativeNotifyKind('approval', true)
++    $activeSessionId.set('viewed-tab')
++    markNativeNotifyBaseline()
++
++    const request = {
++      id: 'fresh-background-approval',
++      method: 'approval',
++      profile: 'default',
++      params: {
++        session_id: 'other-tab',
++        request_id: 'queue-entry',
++        command: 'synthetic command',
++        description: 'test only'
++      },
++      respond: vi.fn(),
++      fail: vi.fn()
++    }
++
++    try {
++      expect(handleServerRequest(request, deps, 'viewed-tab')).toBe(true)
++      expect(notify).toHaveBeenCalledExactlyOnceWith(
++        expect.objectContaining({
++          kind: 'approval',
++          requestId: request.id,
++          sessionId: 'other-tab',
++          actions: [
++            expect.objectContaining({ id: 'approve:queue-entry' }),
++            expect.objectContaining({ id: 'reject:queue-entry' })
++          ]
++        })
++      )
++      handleServerRequest({ ...request, replayed: true }, deps, 'viewed-tab')
++      expect(notify).toHaveBeenCalledTimes(1)
++    } finally {
++      window.hermesDesktop = original
++      $activeSessionId.set(previousSession)
++      clearApprovalRequest('other-tab')
++      resetServerRequestsForTests()
++      __resetNativeNotifyBaselineForTests()
++      vi.restoreAllMocks()
++    }
++  })
++})
++
+ describe('connection request routing', () => {
+   it('does not route connection operations through the server-request rail', () => {
+     const { handled, respond } = deliver(
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+index 483d358d17..2c6fbd2739 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+@@ -368,6 +368,11 @@ const approval: Handler = ctx => {
+   }).catch(() => undefined)
+   markNeedsInput(ctx)
+ 
++  console.info(
++    '[approval-notification]',
++    JSON.stringify({ requestId: request.id, outcome: request.replayed ? 'replayed-no-alert' : 'new-request' })
++  )
++
+   if (!request.replayed) {
+     dispatchNativeNotification({
+       actions: [
+@@ -382,6 +387,7 @@ const approval: Handler = ctx => {
+       ],
+       body: command || description,
+       kind: 'approval',
++      requestId: request.id,
+       sessionId: sessionId || null,
+       title: translateNow('notifications.native.approvalTitle')
+     })
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index e278bcbef9..54c729e513 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -288,6 +288,7 @@ declare global {
+       notify: (payload: HermesNotification) => Promise<boolean>
+       /** Launch -> ready ms for the first caller per app launch, null afterwards. Absent on older shells. */
+       claimStartupLatency?: () => Promise<null | number>
++      dismissNotification?: (requestId: string) => Promise<boolean>
+       requestMicrophoneAccess: () => Promise<boolean>
+       /** read_window_below tool: metadata for the OS window directly underneath this one (never pixels). */
+       readWindowBelow?: () => Promise<{
+@@ -582,7 +583,7 @@ declare global {
+       removeDesktopPlugin?: (payload: { name: string }) => Promise<{ ok: boolean; path?: string; error?: string }>
+       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
+       onFocusSession?: (callback: (sessionId: string) => void) => () => void
+-      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
++      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string; requestId?: string }) => void) => () => void
+       /** Plugin (and other session-less) notification body/action activation. */
+       onNotificationActivate?: (
+         callback: (payload: { actionId?: string; activate?: string; notifyId?: string; tag?: string }) => void
