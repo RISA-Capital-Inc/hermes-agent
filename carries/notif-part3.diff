@@ -1,0 +1,300 @@
+diff --git a/apps/desktop/src/store/native-notifications.test.ts b/apps/desktop/src/store/native-notifications.test.ts
+index 550ab44fb7..11dc28a52c 100644
+--- a/apps/desktop/src/store/native-notifications.test.ts
++++ b/apps/desktop/src/store/native-notifications.test.ts
+@@ -119,6 +119,27 @@ describe('dispatchNativeNotification focus gating', () => {
+     expect(notify).toHaveBeenCalledTimes(1)
+   })
+ 
++  it('notifies a fresh approval even when its session is focused', () => {
++    const sessionId = freshSession()
++    setWindowState({ focused: true, hidden: false })
++    setActiveSessionId(sessionId)
++    dispatchNativeNotification({ kind: 'approval', requestId: 'focused-approval', sessionId, title: 'approve' })
++    expect(notify).toHaveBeenCalledTimes(1)
++  })
++
++  it('does not lose a fresh background approval during another gateway reconnect', () => {
++    setWindowState({ focused: true, hidden: false })
++    setActiveSessionId(freshSession())
++    markNativeNotifyBaseline()
++    dispatchNativeNotification({
++      kind: 'approval',
++      requestId: 'new-during-reconnect',
++      sessionId: freshSession(),
++      title: 'approve'
++    })
++    expect(notify).toHaveBeenCalledTimes(1)
++  })
++
+   it('suppresses an attention notification for the active session when focused', () => {
+     setWindowState({ focused: true, hidden: false })
+     setActiveSessionId('on-screen')
+@@ -298,6 +319,19 @@ describe('sendTestNativeNotification', () => {
+     sendTestNativeNotification('Hermes', 'works')
+     expect(notify).toHaveBeenCalledTimes(1)
+   })
++
++  it('stacks: every press sends a unique tag and a persistent toast', () => {
++    sendTestNativeNotification('Hermes', 'one')
++    sendTestNativeNotification('Hermes', 'two')
++    expect(notify).toHaveBeenCalledTimes(2)
++    const first = notify.mock.calls[0]?.[0] as { persistent?: boolean; tag?: string }
++    const second = notify.mock.calls[1]?.[0] as { persistent?: boolean; tag?: string }
++    expect(first?.persistent).toBe(true)
++    expect(second?.persistent).toBe(true)
++    expect(first?.tag).toMatch(/^test-/)
++    expect(second?.tag).toMatch(/^test-/)
++    expect(first?.tag).not.toBe(second?.tag)
++  })
+ })
+ 
+ describe('respondToApprovalAction', () => {
+@@ -362,6 +396,40 @@ describe('respondToApprovalAction', () => {
+     )
+   })
+ 
++  it('never applies an old notification action to a newer approval in the same session', async () => {
++    setApprovalRequest({ command: 'new command', description: '', sessionId: 'bg', serverRequestId: 'new-request' })
++    await respondToApprovalAction('bg', 'approve', 'old-request')
++    expect(request).not.toHaveBeenCalled()
++  })
++
++  it('lands a toast action: the queue id travels as request_id, the frame id resolves the parked request', async () => {
++    setActiveSessionId('bg')
++    setApprovalRequest({ command: 'deploy', description: '', requestId: 'q-1', serverRequestId: 'srv-1', sessionId: 'bg' })
++    await respondToApprovalAction('bg', 'approve:q-1', 'srv-1')
++    expect(request).toHaveBeenCalledWith(
++      'approval.respond',
++      { all: false, choice: 'once', request_id: 'q-1', session_id: 'bg' },
++      // #55433: the respond RPC carries an explicit deadline covering the backend's approvals window.
++      APPROVAL_RESPOND_REQUEST_TIMEOUT_MS,
++      undefined
++    )
++    expect($approvalRequest.get()).toBeNull()
++  })
++
++  it('resolves by frame id when the action id carries no queue part', async () => {
++    setActiveSessionId('bg')
++    setApprovalRequest({ command: 'deploy', description: '', requestId: 'q-9', serverRequestId: 'srv-9', sessionId: 'bg' })
++    await respondToApprovalAction('bg', 'approve', 'srv-9')
++    expect(request).toHaveBeenCalledWith(
++      'approval.respond',
++      { all: false, choice: 'once', request_id: 'q-9', session_id: 'bg' },
++      // #55433: the respond RPC carries an explicit deadline covering the backend's approvals window.
++      APPROVAL_RESPOND_REQUEST_TIMEOUT_MS,
++      undefined
++    )
++    expect($approvalRequest.get()).toBeNull()
++  })
++
+   it('ignores unknown action ids', async () => {
+     await respondToApprovalAction('bg', 'snooze')
+     expect(request).not.toHaveBeenCalled()
+diff --git a/apps/desktop/src/store/native-notifications.ts b/apps/desktop/src/store/native-notifications.ts
+index cd0e0c2af6..b363d1a994 100644
+--- a/apps/desktop/src/store/native-notifications.ts
++++ b/apps/desktop/src/store/native-notifications.ts
+@@ -190,6 +190,10 @@ export interface NativeNotificationAction {
+ }
+ 
+ export interface NativeNotificationInput {
++  /** Exact approval server request; also scopes actions and dismissal. */
++  requestId?: string
++  /** Keep the toast visible until acted on (Windows) -- used by the settings test button. */
++  persistent?: boolean
+   kind: NativeNotificationKind
+   title: string
+   body?: string
+@@ -224,39 +228,75 @@ export interface NativeNotificationInput {
+  *  must only do so on true, or suppressed/throttled notifications leak it. */
+ export function dispatchNativeNotification(input: NativeNotificationInput): boolean {
+   const prefs = $nativeNotifyPrefs.get()
++  // Only fresh server requests reach this path with an approval requestId;
++  // replay suppression remains in the server-request handler. A blocking
++  // approval must not disappear merely because another socket reconnects or
++  // its tab happened to be focused when the request arrived.
++  const requestOwnedApproval = input.kind === 'approval' && Boolean(input.requestId)
++
++  const trace = (outcome: string) => {
++    if (input.kind === 'approval') {
++      console.info('[approval-notification]', JSON.stringify({ requestId: input.requestId, outcome }))
++    }
++  }
+ 
+   if (!prefs.enabled || !prefs.kinds[input.kind]) {
++    trace('disabled-by-preferences')
++
+     return false
+   }
+ 
+-  if (withinNativeNotifyBaseline()) {
++  if (!requestOwnedApproval && withinNativeNotifyBaseline()) {
++    trace('suppressed-by-reconnect-baseline')
++
+     return false
+   }
+ 
+-  if (!shouldFire(input.kind, input.sessionId, input.global)) {
++  if (!requestOwnedApproval && !shouldFire(input.kind, input.sessionId, input.global)) {
++    trace('suppressed-by-focus')
++
+     return false
+   }
+ 
+-  if (throttled(`${input.kind}:${input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`, Date.now())) {
++  if (
++    throttled(
++      `${input.kind}:${input.requestId ?? input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`,
++      Date.now()
++    )
++  ) {
+     return false
+   }
+ 
+   const namedKey = input.sessionId ? NAMED_TITLE_KEYS[input.kind] : undefined
+   const title = namedKey && input.sessionId ? withSessionLabel(namedKey, input.sessionId) : input.title
+ 
+-  void window.hermesDesktop?.notify({
+-    actions: input.actions,
+-    activate: input.activate,
+-    body: input.body,
+-    focusSessionId: input.sessionId ? (storedSessionIdForRuntimeId(input.sessionId) ?? undefined) : undefined,
+-    icon: input.icon,
+-    kind: input.kind,
+-    notifyId: input.notifyId,
+-    sessionId: input.sessionId ?? undefined,
+-    silent: input.silent,
+-    tag: input.tag,
+-    title
+-  })
++  const bridge = window.hermesDesktop
++
++  if (!bridge?.notify) {
++    trace('no-native-bridge')
++
++    return false
++  }
++
++  trace('dispatching')
++  void bridge
++    .notify({
++      actions: input.actions,
++      activate: input.activate,
++      body: input.body,
++      focusSessionId: input.sessionId ? (storedSessionIdForRuntimeId(input.sessionId) ?? undefined) : undefined,
++      icon: input.icon,
++      kind: input.kind,
++      notifyId: input.notifyId,
++      persistent: input.persistent,
++      requestId: input.requestId,
++      sessionId: input.sessionId ?? undefined,
++      silent: input.silent,
++      tag: input.tag,
++      title
++    })
++    .then(accepted => trace(accepted ? 'ipc-accepted' : 'ipc-rejected'))
++    .catch(() => trace('ipc-error'))
+ 
+   return true
+ }
+@@ -384,9 +424,18 @@ export function dispatchPluginNativeNotification(pluginId: string, input: Plugin
+ 
+ // Resolve a pending approval from a notification button, mirroring the in-app
+ // Run/Reject bar. Keyed by session id — a background approval has no local guard.
+-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
++export async function respondToApprovalAction(
++  sessionId: null | string,
++  actionId: string,
++  explicitRequestId?: string
++): Promise<void> {
+   const [action, ...idParts] = actionId.split(':')
+-  const requestId = idParts.length ? idParts.join(':') : sessionApprovalRequest(sessionId).get()?.requestId
++  // The approval QUEUE id (what approval.pending / approval.received /
++  // approval.respond key on) when the action embeds it; `explicitRequestId` is
++  // the notification's own server-request frame identity (live ack path).
++  const queueId = idParts.length ? idParts.join(':') : undefined
++  const frameId = explicitRequestId
++
+   const choice = action === 'approve' ? 'once' : action === 'reject' ? 'deny' : null
+ 
+   if (!choice) {
+@@ -404,14 +453,29 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
+   }
+ 
+   try {
++    // Match by frame identity (live prompts) or by queue id (restored entries):
++    // a toast action carries both, a legacy/in-app action only the queue id.
+     const parked = sessionApprovalRequests(sessionId)
+       .get()
+-      .find(request => request.requestId === requestId)
++      .find(request => (frameId && request.serverRequestId === frameId) || (queueId && request.requestId === queueId))
++
++    // A native action whose toast outlived its request must never answer a newer
++    // approval parked in the same session: compare against the parked request's
++    // backend identity (serverRequestId), not the toast's own id.
++    const liveParked = sessionApprovalRequest(sessionId).get()
++
++    if (frameId && liveParked?.serverRequestId && liveParked.serverRequestId !== frameId) {
++      console.info('[approval-notification]', JSON.stringify({ frameId, outcome: 'action-stale-dropped', queueId }))
++
++      return
++    }
++
++    await answerApproval(gateway, parked ?? { requestId: queueId, serverRequestId: frameId, sessionId }, choice)
+ 
+-    await answerApproval(gateway, parked ?? { sessionId, requestId }, choice)
++    const clearedId = parked?.requestId ?? queueId
+ 
+-    if (requestId || sessionApprovalRequest(sessionId).get()?.requestId === undefined) {
+-      clearApprovalRequest(sessionId, requestId)
++    if (clearedId || sessionApprovalRequest(sessionId).get()?.requestId === undefined) {
++      clearApprovalRequest(sessionId, clearedId)
+     }
+ 
+     void replayPendingApproval(gateway, sessionId).catch(() => undefined)
+@@ -434,7 +498,16 @@ export async function sendTestNativeNotification(title: string, body: string): P
+   }
+ 
+   try {
+-    return await bridge.notify({ body, kind: 'turnDone', title })
++    // Unique tag + persistent: repeated presses stack as separate toasts (no dedupe
++    // collapse, no replacement) and stay visible on Windows until dismissed, so the
++    // button demonstrates what a pile of pending requests actually looks like.
++    return await bridge.notify({
++      body,
++      kind: 'turnDone',
++      persistent: true,
++      tag: `test-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
++      title
++    })
+   } catch {
+     return false
+   }
+diff --git a/apps/desktop/src/store/server-requests.ts b/apps/desktop/src/store/server-requests.ts
+index 5b234a9200..d43d215d87 100644
+--- a/apps/desktop/src/store/server-requests.ts
++++ b/apps/desktop/src/store/server-requests.ts
+@@ -20,7 +20,12 @@ export function rememberServerRequest(request: ServerRequest): void {
+ }
+ 
+ export function forgetServerRequest(id: string): void {
++  const request = open.get(id)
+   open.delete(id)
++
++  if (request?.method === 'approval') {
++    void window.hermesDesktop?.dismissNotification?.(id)?.catch(() => undefined)
++  }
+ }
+ 
+ /** Answer request `id`. False when nothing is open under that id (expired / already answered). */
+@@ -31,8 +36,8 @@ export function respondToServerRequest(id: string | undefined, result: Record<st
+     return false
+   }
+ 
+-  open.delete(id!)
+   request.respond(result)
++  forgetServerRequest(id!)
+ 
+   return true
+ }
