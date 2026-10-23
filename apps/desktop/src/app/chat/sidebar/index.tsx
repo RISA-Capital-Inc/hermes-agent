@@ -23,9 +23,10 @@ import {
 } from '@/components/ui/sidebar'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
-import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
+import { type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
+import { bucketSessionsByOwner, normalizeOwner } from '@/lib/session-owner'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
@@ -45,6 +46,7 @@ import {
   $sidebarGrouping,
   $sidebarMessagingOpenIds,
   $sidebarOrdering,
+  $sidebarOwnerFilter,
   $sidebarPinsOpen,
   $sidebarPrDataWanted,
   $sidebarPrFilter,
@@ -174,6 +176,7 @@ import {
   sessionMatchesProjectFilter,
   sessionRecency as sessionTime,
   type SidebarProjectTree,
+  type SidebarSessionGroup,
   type SidebarWorkspaceTree,
   sortProjectsForOverview,
   StartWorkButton,
@@ -191,6 +194,7 @@ import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 import { useEnteredProjectSessions } from './use-entered-project-sessions'
+import { useServerSessionSearch } from './use-server-session-search'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
 // front, reveal more in larger steps on demand. Keeps a busy platform from
@@ -458,6 +462,7 @@ export function ChatSidebar({
   const statusFilter = useStore($sidebarStatusFilter)
   const persistedProjectFilter = useStore($sidebarProjectFilter)
   const profileFilter = useStore($sidebarProfileFilter)
+  const ownerFilter = useStore($sidebarOwnerFilter)
   const prFilter = useStore($sidebarPrFilter)
   const prDataWanted = useStore($sidebarPrDataWanted)
   const prBranchOverrides = useStore($prBranchBySession)
@@ -545,8 +550,6 @@ export function ChatSidebar({
   const newSessionCombo = useStore($bindings)['session.new']?.[0]
   const newSessionKbd = newSessionCombo ? comboTokens(newSessionCombo) : []
   const [searchQuery, setSearchQuery] = useState('')
-  const [serverMatches, setServerMatches] = useState<SessionSearchResult[]>([])
-  const [searchPending, setSearchPending] = useState(false)
   const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
   const [messagingLoadMorePending, setMessagingLoadMorePending] = useState<Record<string, boolean>>({})
   const [recentsLoadMorePending, setRecentsLoadMorePending] = useState(false)
@@ -625,6 +628,12 @@ export function ChatSidebar({
         return false
       }
 
+      // Login narrowing. Empty is the shipped view; a picked owner hides rows
+      // from the other logins even when they share the same profile.
+      if (ownerFilter.length && !ownerFilter.includes(normalizeOwner(session.user_id))) {
+        return false
+      }
+
       if (prFilter.length) {
         const key = sessionPrKey(session)
 
@@ -642,6 +651,7 @@ export function ChatSidebar({
       statusFilter,
       projectFilter,
       profileFilter,
+      ownerFilter,
       showAllProfiles,
       prFilter,
       pullRequests,
@@ -654,6 +664,7 @@ export function ChatSidebar({
   const filtersNarrow =
     statusFilter.length > 0 ||
     projectFilter.length > 0 ||
+    ownerFilter.length > 0 ||
     prFilter.length > 0 ||
     (showAllProfiles && profileFilter.length > 0)
 
@@ -742,41 +753,7 @@ export function ChatSidebar({
     [isPinnedSession, filtersNarrow, sessionMatchesFilters]
   )
 
-  // Full-text search across *all* sessions (not just the loaded page) so 699
-  // sessions stay findable. Debounced; loaded sessions are matched instantly
-  // client-side and merged ahead of the server hits.
-  useEffect(() => {
-    if (!trimmedQuery) {
-      setServerMatches([])
-      setSearchPending(false)
-
-      return
-    }
-
-    let cancelled = false
-
-    setSearchPending(true)
-
-    const id = window.setTimeout(() => {
-      void searchSessions(trimmedQuery)
-        .then(res => {
-          if (!cancelled) {
-            setServerMatches(res.results)
-          }
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          if (!cancelled) {
-            setSearchPending(false)
-          }
-        })
-    }, 200)
-
-    return () => {
-      cancelled = true
-      window.clearTimeout(id)
-    }
-  }, [trimmedQuery])
+  const { searchPending, serverMatches } = useServerSessionSearch(trimmedQuery, profileScope)
 
   const searchResults = useMemo(
     () => mergeSearchResults(sortedSessions, trimmedQuery, serverMatches, sessionByAnyId, searchPending),
@@ -1043,7 +1020,21 @@ export function ChatSidebar({
     // Layer the user's manual drag-order on top of the deterministic sort. Empty
     // (default) returns `sorted` untouched; projects the user hasn't ordered yet
     // keep their sorted position rather than jumping the hand-picked list.
-    return orderProjectsByIds(sorted, projectOrderIds)
+    // Deduplicate by id — safety net for backend merge edge cases
+    // (e.g. Windows path-casing differences across profiles).
+    const seen = new Set<string>()
+
+    const deduped = sorted.filter(project => {
+      if (seen.has(project.id)) {
+        return false
+      }
+
+      seen.add(project.id)
+
+      return true
+    })
+
+    return orderProjectsByIds(deduped, projectOrderIds)
   }, [
     projectTree,
     dismissedAutoProjects,
@@ -1392,6 +1383,24 @@ export function ChatSidebar({
   // ([connectionId, profile]), so a platform's groups line up with recents.
   const ownerGrouped = profileScope === ALL_PROFILES && grouping === 'profile'
   const profileGroups = useGatewaySessionGroups(agentSessions, ownerGrouped)
+  // Login grouping is a different axis from profile grouping: same rows,
+  // bucketed by `user_id`. It renders through the generic group lane (a lane
+  // with no path and no git), so no per-profile header action is offered that
+  // would try to create a session in a login's name.
+  const ownerLoginGroups = useMemo<SidebarSessionGroup[] | undefined>(() => {
+    if (grouping !== 'owner') {
+      return undefined
+    }
+
+    return bucketSessionsByOwner(agentSessions).map(bucket => ({
+      id: `owner:${bucket.key}`,
+      isGit: false,
+      label: bucket.key,
+      mode: 'workspace' as const,
+      path: null,
+      sessions: bucket.sessions
+    }))
+  }, [agentSessions, grouping])
   const connectionsRegistry = useStore($connectionsRegistry)
   const profileColors = useStore($profileColors)
 
@@ -1471,7 +1480,7 @@ export function ChatSidebar({
   // state-based keys stay bucketed, where they read correctly per day.
   const rankedGlobally = ordering === 'cost' || ordering === 'tokens'
 
-  const displayAgentGroups = profileGroups
+  const displayAgentGroups = ownerLoginGroups ?? profileGroups
 
   // The recents list owns its own (virtualized) scroll container only when it's a
   // long flat list. In that case it must keep its scroller even in short mode, so

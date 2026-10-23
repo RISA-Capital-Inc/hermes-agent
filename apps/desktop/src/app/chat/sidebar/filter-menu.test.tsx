@@ -1,17 +1,20 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, expect, it } from 'vitest'
 
+import type { SessionInfo } from '@/hermes'
 import { I18nProvider, TRANSLATIONS, useI18n } from '@/i18n'
 import type { I18nContextValue } from '@/i18n'
 import { $interfaceMode } from '@/store/interface-mode'
 import {
   $sidebarListGroupIds,
   $sidebarOrdering,
+  $sidebarOwnerFilter,
   $sidebarStatusFilter,
   resetSidebarView,
   setSidebarGrouping,
   setSidebarOrdering
 } from '@/store/layout'
+import { $sessions } from '@/store/session'
 
 import { SidebarFilterMenu } from './filter-menu'
 
@@ -25,6 +28,7 @@ function Menu() {
 
 afterEach(() => {
   cleanup()
+  $sessions.set([])
   resetSidebarView()
 })
 
@@ -58,4 +62,28 @@ it('translates the live filter menu while preserving selected values and the cur
   expect(screen.getByRole('menuitemcheckbox', { name: ja.needsInput }).getAttribute('aria-checked')).toBe('true')
   expect(screen.queryByRole('menuitemcheckbox', { name: zh.needsInput })).toBeNull()
   expect($sidebarOrdering.get()).toBe('manual')
+})
+
+it('offers one Owner checkbox per loaded login and hides the submenu for a single owner', () => {
+  $interfaceMode.set('advanced')
+  render(
+    <I18nProvider configClient={null} initialLocale="en">
+      <Menu />
+    </I18nProvider>
+  )
+  const filters = TRANSLATIONS.en.sidebar.filter.filters
+  fireEvent.keyDown(screen.getByRole('button', { name: filters }), { key: 'Enter' })
+  // One bucket (`Unattributed`) cannot narrow anything.
+  expect(screen.queryByRole('menuitem', { name: 'Owner' })).toBeNull()
+
+  act(() =>
+    $sessions.set([
+      { id: 'a', user_id: 'basic:one@example.com' },
+      { id: 'b', user_id: 'risa-users:two@example.com' }
+    ] as unknown as SessionInfo[])
+  )
+  expect(screen.getByRole('menuitem', { name: 'Owner' })).toBeTruthy()
+  fireEvent.keyDown(screen.getByRole('menuitem', { name: 'Owner' }), { key: 'ArrowRight' })
+  fireEvent.click(screen.getByRole('menuitemcheckbox', { name: 'one@example.com' }))
+  expect($sidebarOwnerFilter.get()).toEqual(['one@example.com'])
 })
