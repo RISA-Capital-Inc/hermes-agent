@@ -649,6 +649,11 @@ export interface SessionInfo {
    *  rows served by the primary/local backend. Opens must route through the
    *  connection-scoped gateway (`ensureGatewayAgent`) when present. */
   connection_id?: string
+  /** Login that created the row, as the backend recorded it (`basic:…`,
+   *  `risa-users:…`). Present on the REST listings the sidebar reads; the
+   *  JSON-RPC `session.list` summary does not carry it. Null/absent for rows
+   *  with no attributable login. */
+  user_id?: null | string
 }
 
 export type TimelineDisplayMetadata =

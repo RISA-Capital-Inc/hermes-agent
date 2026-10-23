@@ -26,6 +26,7 @@ import { useContributions } from '@/contrib/react/use-contributions'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
+import { bucketSessionsByOwner, normalizeOwner } from '@/lib/session-owner'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
@@ -45,6 +46,7 @@ import {
   $sidebarGrouping,
   $sidebarMessagingOpenIds,
   $sidebarOrdering,
+  $sidebarOwnerFilter,
   $sidebarPinsOpen,
   $sidebarPrDataWanted,
   $sidebarPrFilter,
@@ -174,6 +176,7 @@ import {
   sessionMatchesProjectFilter,
   sessionRecency as sessionTime,
   type SidebarProjectTree,
+  type SidebarSessionGroup,
   type SidebarWorkspaceTree,
   sortProjectsForOverview,
   StartWorkButton,
@@ -458,6 +461,7 @@ export function ChatSidebar({
   const statusFilter = useStore($sidebarStatusFilter)
   const persistedProjectFilter = useStore($sidebarProjectFilter)
   const profileFilter = useStore($sidebarProfileFilter)
+  const ownerFilter = useStore($sidebarOwnerFilter)
   const prFilter = useStore($sidebarPrFilter)
   const prDataWanted = useStore($sidebarPrDataWanted)
   const prBranchOverrides = useStore($prBranchBySession)
@@ -625,6 +629,12 @@ export function ChatSidebar({
         return false
       }
 
+      // Login narrowing. Empty is the shipped view; a picked owner hides rows
+      // from the other logins even when they share the same profile.
+      if (ownerFilter.length && !ownerFilter.includes(normalizeOwner(session.user_id))) {
+        return false
+      }
+
       if (prFilter.length) {
         const key = sessionPrKey(session)
 
@@ -642,6 +652,7 @@ export function ChatSidebar({
       statusFilter,
       projectFilter,
       profileFilter,
+      ownerFilter,
       showAllProfiles,
       prFilter,
       pullRequests,
@@ -654,6 +665,7 @@ export function ChatSidebar({
   const filtersNarrow =
     statusFilter.length > 0 ||
     projectFilter.length > 0 ||
+    ownerFilter.length > 0 ||
     prFilter.length > 0 ||
     (showAllProfiles && profileFilter.length > 0)
 
@@ -1392,6 +1404,24 @@ export function ChatSidebar({
   // ([connectionId, profile]), so a platform's groups line up with recents.
   const ownerGrouped = profileScope === ALL_PROFILES && grouping === 'profile'
   const profileGroups = useGatewaySessionGroups(agentSessions, ownerGrouped)
+  // Login grouping is a different axis from profile grouping: same rows,
+  // bucketed by `user_id`. It renders through the generic group lane (a lane
+  // with no path and no git), so no per-profile header action is offered that
+  // would try to create a session in a login's name.
+  const ownerLoginGroups = useMemo<SidebarSessionGroup[] | undefined>(() => {
+    if (grouping !== 'owner') {
+      return undefined
+    }
+
+    return bucketSessionsByOwner(agentSessions).map(bucket => ({
+      id: `owner:${bucket.key}`,
+      isGit: false,
+      label: bucket.key,
+      mode: 'workspace',
+      path: null,
+      sessions: bucket.sessions
+    }))
+  }, [agentSessions, grouping])
   const connectionsRegistry = useStore($connectionsRegistry)
   const profileColors = useStore($profileColors)
 
@@ -1471,7 +1501,7 @@ export function ChatSidebar({
   // state-based keys stay bucketed, where they read correctly per day.
   const rankedGlobally = ordering === 'cost' || ordering === 'tokens'
 
-  const displayAgentGroups = profileGroups
+  const displayAgentGroups = ownerLoginGroups ?? profileGroups
 
   // The recents list owns its own (virtualized) scroll container only when it's a
   // long flat list. In that case it must keep its scroller even in short mode, so

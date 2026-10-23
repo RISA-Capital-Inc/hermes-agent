@@ -63,6 +63,7 @@ const SIDEBAR_STATUS_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarStatusFilter'
 const SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY = 'hermes.desktop.sidebarShowArchived'
 const SIDEBAR_PROJECT_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProjectFilter'
 const SIDEBAR_PROFILE_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProfileFilter'
+const SIDEBAR_OWNER_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarOwnerFilter'
 const SIDEBAR_PR_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarPrFilter'
 const SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceOrder'
 const SIDEBAR_WORKSPACE_PARENT_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceParentOrder'
@@ -272,7 +273,7 @@ export const $sidebarAgentsGrouped: ReadableAtom<boolean> = computed(
 /** How the recents list is divided. `date` is the sidebar's long-standing
  *  default (Today / Yesterday / Last week dividers). `profile` only means
  *  anything while the sidebar is showing every profile at once. */
-export const SIDEBAR_GROUPING_ORDER = ['date', 'project', 'status', 'profile'] as const
+export const SIDEBAR_GROUPING_ORDER = ['date', 'project', 'status', 'profile', 'owner'] as const
 /** Derived from the order so a new grouping cannot exist without a slot in the
  *  filter menu and the `view.cycleSidebarGrouping` keybind, which both walk it. */
 export type SidebarGrouping = (typeof SIDEBAR_GROUPING_ORDER)[number]
@@ -395,6 +396,15 @@ export const $sidebarProfileFilter = persistentAtom(
   Codecs.stringArray
 )
 
+// Owner buckets, as `normalizeOwner` reports them (bare login plus the shared
+// `Unattributed` key). Login is orthogonal to profile: two people can write
+// into the same profile, which is exactly what this filter separates.
+export const $sidebarOwnerFilter = persistentAtom(
+  SIDEBAR_OWNER_FILTER_STORAGE_KEY,
+  [] as string[],
+  Codecs.stringArray
+)
+
 // Whether a session's branch has a PR, and in what state. Fetched per repo via
 // `gh` (see store/pull-requests), so this is empty on backends without a local
 // checkout — the menu hides the submenu rather than offering a dead filter.
@@ -417,9 +427,21 @@ export const $sidebarOrdering: ReadableAtom<SidebarOrdering> = computed(
 )
 
 export const $sidebarFiltersActive: ReadableAtom<boolean> = computed(
-  [$sidebarStatusFilter, $sidebarProjectFilter, $sidebarProfileFilter, $sidebarPrFilter, $sidebarShowArchived],
-  (statuses, projects, profiles, prs, archived) =>
-    statuses.length > 0 || projects.length > 0 || profiles.length > 0 || prs.length > 0 || archived
+  [
+    $sidebarStatusFilter,
+    $sidebarProjectFilter,
+    $sidebarProfileFilter,
+    $sidebarOwnerFilter,
+    $sidebarPrFilter,
+    $sidebarShowArchived
+  ],
+  (statuses, projects, profiles, owners, prs, archived) =>
+    statuses.length > 0 ||
+    projects.length > 0 ||
+    profiles.length > 0 ||
+    owners.length > 0 ||
+    prs.length > 0 ||
+    archived
 )
 
 /** Anything at all moved off the shipped view — what makes a reset worth
@@ -839,8 +861,9 @@ export function setSidebarGrouping(grouping: SidebarGrouping) {
   // Grouping by owner is a request to see every owner, so it turns the
   // all-profiles view on rather than drawing one group around one profile —
   // and every write that follows must target that scope, not the one we were
-  // in when the click landed. (The flat scope's atom can't hold 'profile'.)
-  if (grouping === 'profile') {
+  // in when the click landed. (The flat scope's atom can't hold 'profile' or
+  // 'owner'.) Both dimensions are about who wrote a row, so both widen first.
+  if (grouping === 'profile' || grouping === 'owner') {
     setShowAllProfiles(true)
     $sidebarAllProfilesAgentsGrouped.set(false)
     $sidebarAllProfilesGrouping.set(grouping)
@@ -909,6 +932,10 @@ export function toggleSidebarProfileFilter(profile: string) {
   toggleIn($sidebarProfileFilter, profile)
 }
 
+export function toggleSidebarOwnerFilter(owner: string) {
+  toggleIn($sidebarOwnerFilter, owner)
+}
+
 export function toggleSidebarPrFilter(bucket: PullRequestBucket) {
   toggleIn($sidebarPrFilter, bucket)
 }
@@ -917,6 +944,7 @@ function clearSidebarFilters() {
   $sidebarStatusFilter.set([])
   $sidebarProjectFilter.set([])
   $sidebarProfileFilter.set([])
+  $sidebarOwnerFilter.set([])
   $sidebarPrFilter.set([])
   $sidebarShowArchived.set(false)
 }
