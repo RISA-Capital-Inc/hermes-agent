@@ -1396,7 +1396,7 @@ export function ChatSidebar({
       id: `owner:${bucket.key}`,
       isGit: false,
       label: bucket.key,
-      mode: 'workspace' as const,
+      mode: 'workspace',
       path: null,
       sessions: bucket.sessions
     }))
