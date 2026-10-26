@@ -1490,6 +1490,23 @@ class TestBuildSafeEnv:
         assert "SECRET_KEY" not in result
         assert "AWS_ACCESS_KEY_ID" not in result
 
+    def test_credentials_directory_path_is_forwarded(self):
+        """systemd's credential PATH reaches stdio children; the tokens beside it do not."""
+        from tools.mcp_tool_config import _build_safe_env
+
+        fake_env = {
+            "PATH": "/usr/bin",
+            "CREDENTIALS_DIRECTORY": "/run/credentials/hermes-gateway.service",
+            "BWS_ACCESS_TOKEN": "should_not_appear",
+            "OPENROUTER_API_KEY": "should_not_appear",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            result = _build_safe_env(None)
+
+        assert result["CREDENTIALS_DIRECTORY"] == "/run/credentials/hermes-gateway.service"
+        assert "BWS_ACCESS_TOKEN" not in result
+        assert "OPENROUTER_API_KEY" not in result
+
     def test_secret_vars_excluded(self):
         """Sensitive env vars from os.environ are NOT passed through."""
         from tools.mcp_tool_config import _build_safe_env
