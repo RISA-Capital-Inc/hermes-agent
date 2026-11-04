@@ -114,3 +114,70 @@ def _layer_over_inherited(inherited: dict[str, Any], user: dict[str, Any]) -> di
             continue
         merged[key] = value
     return merged
+
+
+# -- Per-model auxiliary routing (model_map) ------------------------------------------------------
+#
+# ``auxiliary.<task>.model_map`` keys an auxiliary route to the SESSION model instead of to the
+# host. A pin written for one model must never survive a switch to another: the compressor sizes
+# its trigger from the auxiliary window, so a stale pin silently compacts a long-context session
+# hundreds of thousands of tokens early. A model with no entry keeps the block's own behaviour,
+# including ``provider: auto`` + empty model, which means "inherit the session model".
+
+
+def _normalize_model_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def aux_model_map_entry(task: str, main_model: str | None,
+                        config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """``auxiliary.<task>.model_map[main_model]``, or ``{}`` when that model has no entry.
+
+    Matching is case-insensitive and whitespace-tolerant. Keys are matched in file order, so keep
+    the map small and unambiguous; an entry that is not a dict is ignored rather than fatal.
+    """
+    if not task or not _normalize_model_key(main_model):
+        return {}
+    cfg = _get_auxiliary_task_config(task) if config is None else config
+    mapping = cfg.get("model_map") if isinstance(cfg, dict) else None
+    if not isinstance(mapping, dict):
+        return {}
+    wanted = _normalize_model_key(main_model)
+    for key, entry in mapping.items():
+        if _normalize_model_key(key) == wanted and isinstance(entry, dict):
+            return entry
+    return {}
+
+
+def apply_aux_model_map(task: str, main_model: str | None,
+                        config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Layer the entry for ``main_model`` over the task's effective config.
+
+    Only the keys the entry sets are overridden; timeouts, ``extra_body`` and fallback chains stay
+    as configured. With no entry the config comes back unchanged, so the task keeps following its
+    own block - ``provider: auto`` with an empty model inherits the session model and its window.
+    """
+    base = _get_auxiliary_task_config(task) if config is None else config
+    if not isinstance(base, dict):
+        base = {}
+    entry = aux_model_map_entry(task, main_model, base)
+    if not entry:
+        return base
+    merged = {k: v for k, v in base.items() if k != "model_map"}
+    merged.update({k: v for k, v in entry.items() if k != "model_map"})
+    return merged
+
+
+def aux_model_map_context_length(task: str, main_model: str | None,
+                                 config: dict[str, Any] | None = None) -> int | None:
+    """The ``context_length`` hint declared on that model's entry, or None.
+
+    Local lanes frequently cannot report their own window, so an entry may pin it; the compression
+    feasibility probe prefers this hint over re-deriving one from the endpoint.
+    """
+    raw = aux_model_map_entry(task, main_model, config).get("context_length")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None

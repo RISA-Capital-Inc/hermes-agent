@@ -5401,7 +5401,10 @@ def resolve_provider_client(
 
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str, Any]] = None) -> tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+        task or None,
+        main_model=(main_runtime or {}).get("model") if isinstance(main_runtime, dict) else None,
+    )
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
@@ -6054,17 +6057,23 @@ def _named_custom_provider_present(name: str) -> bool:
 
 def _resolve_task_provider_model(
     task: str | None = None, provider: str | None = None, model: str | None = None, base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    api_key: Optional[str] = None, main_model: Optional[str] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine (provider, model, base_url, api_key, api_mode) for a call.
 
-    Priority: explicit args > config auxiliary.{task}.* > "auto". A bare base_url means custom,
+    Priority: explicit args > config auxiliary.{task}.* > "auto". Within
+    auxiliary.{task}.*, a ``model_map`` entry keyed to the session model wins over the block's
+    own route, so an override written for one model cannot follow a session onto another. A bare
+    base_url means custom,
     but a first-class provider + base_url keeps the provider identity so its auth/transport
     shaping still applies. api_mode is "chat_completions", "codex_responses", or None (auto).
     """
     cfg_provider = cfg_model = cfg_base_url = cfg_api_key = resolved_api_mode = None
     if task:
-        task_config = _get_auxiliary_task_config(task)
+        # Model-keyed override (risa-platform#241): a map entry for THIS session model wins; no
+        # entry leaves the block untouched, so ``provider: auto`` keeps inheriting the model.
+        _map_model = main_model if main_model is not None else _read_main_model_for_aux()
+        task_config = apply_aux_model_map(task, _map_model, _get_auxiliary_task_config(task))
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
@@ -6144,7 +6153,7 @@ _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 
 # Read-time resolution of auxiliary.<task> (plugin defaults, inherit_from) lives in its own module;
 # re-exported here because callers and tests reach it as agent.auxiliary_client._get_auxiliary_task_config.
-from agent.auxiliary_task_config import _get_auxiliary_task_config
+from agent.auxiliary_task_config import _get_auxiliary_task_config, apply_aux_model_map
 
 
 class CompressionFastLane(NamedTuple):

@@ -2044,6 +2044,12 @@ def check_compression_model_feasibility(agent: Any) -> None:
             _aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")
         )
         _aux_cfg_ctx = getattr(agent, "_aux_compression_context_length_config", None)
+        if _aux_cfg_ctx is None:
+            # A model_map entry may pin the summariser's window for THIS session model
+            # (risa-platform#241). Local lanes often cannot report their own context, and the
+            # window decides whether the session trigger gets clamped to it below.
+            from agent.auxiliary_task_config import aux_model_map_context_length
+            _aux_cfg_ctx = aux_model_map_context_length("compression", getattr(agent, "model", ""))
         if _aux_cfg_ctx is None and _aux_inherits_main_route(agent, aux_model, aux_base_url):
             # Same model on the same route: reuse the main model's already-resolved window (which honours
             # model.context_length / provider pins). Re-resolving from scratch lost the pin and auto-lowered
