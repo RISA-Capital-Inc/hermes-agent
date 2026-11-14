@@ -6,6 +6,22 @@ import { createNotificationRegistry } from './notification-registry'
 
 afterEach(() => vi.useRealTimers())
 
+it('keeps request-owned notifications until their request retires, not the generic TTL', () => {
+  vi.useFakeTimers()
+  const registry = createNotificationRegistry({ ttlMs: 1000 })
+  const notification = Object.assign(new EventEmitter(), { close: vi.fn() })
+  const dismiss = registry.retain(notification, { requestOwned: true })
+  vi.advanceTimersByTime(300_000)
+  expect(notification.close).not.toHaveBeenCalled()
+  expect(registry.has(notification)).toBe(true)
+  dismiss()
+  expect(notification.close).toHaveBeenCalledOnce()
+  expect(registry.has(notification)).toBe(false)
+  dismiss()
+  expect(notification.close).toHaveBeenCalledOnce()
+  expect(vi.getTimerCount()).toBe(0)
+})
+
 it('retains a dismissed banner until its later click or action is consumed', () => {
   vi.useFakeTimers()
   const registry = createNotificationRegistry()

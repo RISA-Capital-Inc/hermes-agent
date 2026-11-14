@@ -13,8 +13,9 @@ export function createNotificationRegistry({ ttlMs = NOTIFICATION_RETENTION_TTL_
   const live = new Set<RetainedNotification>()
   const releaseEvents = releaseOnClose ? [...RELEASE_EVENTS, 'close'] : RELEASE_EVENTS
 
-  function retain(notification: RetainedNotification): void {
+  function retain(notification: RetainedNotification, { requestOwned = false } = {}): () => void {
     live.add(notification)
+    let timer: ReturnType<typeof setTimeout> | undefined
 
     const release = () => {
       clearTimeout(timer)
@@ -29,13 +30,20 @@ export function createNotificationRegistry({ ttlMs = NOTIFICATION_RETENTION_TTL_
       notification.on(event, release)
     }
 
-    // Bound retention without leaving an OS notification whose handler is gone.
-    const timer = setTimeout(() => {
+    const dismiss = () => {
+      if (!live.has(notification)) {return}
       notification.close()
       release()
-    }, ttlMs)
+    }
 
-    timer.unref()
+    // Request-owned notifications follow the backend lifecycle instead of an
+    // unrelated retention limit. The owning renderer must dismiss on retirement.
+    if (!requestOwned) {
+      timer = setTimeout(dismiss, ttlMs)
+      timer.unref()
+    }
+
+    return dismiss
   }
 
   return { retain, has: (notification: RetainedNotification) => live.has(notification) }
