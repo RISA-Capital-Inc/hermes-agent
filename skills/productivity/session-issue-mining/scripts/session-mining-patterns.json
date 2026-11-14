@@ -1,0 +1,7 @@
+{
+  "client_patterns": [
+    "(?i)window\\s*shop",
+    "(?i)windowshop"
+  ],
+  "_comment": "Add this host's client/company names, client emails, and project codenames. Anything matching flags the session out of the GitHub lane."
+}

@@ -1,0 +1,6 @@
+DAILY SESSION MINING (job: session-issue-mining). The SCRIPT RESULTS block below is a digest of this host's Hermes sessions from the last 24h. Work these steps and nothing else:
+1) If the digest says NO_SESSIONS_IN_WINDOW: reply NONE and stop.
+2) Identify REAL issues: repeated tool failures, broken cron jobs, model/lane failures, config gaps, missing credentials, regressions. Ignore one-off transient noise and style comments.
+3) Write the file ~/.hermes/cache/session-mining/issues-<YYYYMMDD>.json (today's date) containing a JSON array of items: {"title": "<stable short specific title, no date>", "body": "markdown: what failed, evidence (short quote), impact", "resolved": true or false}. Set resolved=true ONLY if the digest shows the session fixed it; then the body MUST end with a "## Resolution" section stating the fix.
+HARD RULES for titles and bodies: NO client or customer names, NO emails, NO phone numbers, NO dollar amounts, NO addresses, NO account or policy numbers, NO credentials or token values, NO personal data. If an item touches client material, SKIP it entirely. Never expand or reuse content from lines marked CLIENT-FLAGGED.
+4) If you wrote items, run via terminal: python3 ~/.hermes/scripts/session-issue-post.py — then report the RESULT/SUMMARY lines it prints. If you wrote no items, reply NONE.
