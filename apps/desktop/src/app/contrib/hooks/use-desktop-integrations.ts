@@ -191,9 +191,9 @@ export function useDesktopIntegrations({
           !isOverlayView(appViewForPath(route)) &&
           (!routeSession || (restorableRouteSession && sessionBelongsToProfile(sessions, routeSession, activeProfile)))
         ) {
-          // The user may have started typing on the fresh chat while the backend
-          // was still coming up; the composer moves that draft onto the restored
-          // session when its scope swaps (#114122).
+          // The user may have started typing on the fresh chat while the
+          // backend was still coming up; the composer moves that draft onto
+          // the restored session when its scope swaps (#114122).
           announceNewSessionDraftKey(routeSession && resolveComposerSessionKey(routeSession, sessions))
           navigate(route, { replace: true })
 
@@ -423,6 +423,7 @@ export function useDesktopIntegrations({
             return `${k}=${sval}`
           })
           .join(' ')
+
         const command = `/blueprint ${action.name}${slots ? ' ' + slots : ''}`
         requestComposerInsert(command, { mode: 'block', target: 'main' })
         requestComposerFocus('main')
