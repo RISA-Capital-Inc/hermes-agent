@@ -23,7 +23,7 @@ test('fresh-install provenance admits tagless commit stamps without relaxing upd
     const tagged = { ...stamp, tag, source: 'git', branch: 'main', displayVersion: tag.slice(1),
       updateMechanism: platform === 'darwin' ? 'electron-updater' : 'app-installer' }
     expect(verifyBundleStamp(tagged, { commit, tag, platform })).toBe(tag.slice(1))
-    expect(() => verifyBundleStamp({ ...tagged, updateMechanism: 'external' }, { commit, tag, platform })).toThrow('updateMechanism')
+    expect(() => verifyBundleStamp({ ...tagged, updateMechanism: 'external' }, { commit, platform })).toThrow('updateMechanism')
   }
   expect(stampAssertions(stamp, { commit, tag: null }).join(';')).toContain('electron-updater')
 })
@@ -109,7 +109,7 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
       expect(run('identity').status).not.toBe(0)
     }
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
-}, 60_000)
+}, 60_000) // cold-runner disk I/O can exceed 15s
 
 test('workspace admission rejects reuse and symlink escapes before creating anything outside runner temp', () => {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-paths-')))
