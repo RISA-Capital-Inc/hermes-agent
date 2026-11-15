@@ -23,7 +23,7 @@ test('fresh-install provenance admits tagless commit stamps without relaxing upd
     const tagged = { ...stamp, tag, source: 'git', branch: 'main', displayVersion: tag.slice(1),
       updateMechanism: platform === 'darwin' ? 'electron-updater' : 'app-installer' }
     expect(verifyBundleStamp(tagged, { commit, tag, platform })).toBe(tag.slice(1))
-    expect(() => verifyBundleStamp({ ...tagged, updateMechanism: 'external' }, { commit, platform })).toThrow('updateMechanism')
+    expect(() => verifyBundleStamp({ ...tagged, updateMechanism: 'external' }, { commit, tag, platform })).toThrow('updateMechanism')
   }
   expect(stampAssertions(stamp, { commit, tag: null }).join(';')).toContain('electron-updater')
 })
