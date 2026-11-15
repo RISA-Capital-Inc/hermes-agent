@@ -1,8 +1,10 @@
+import type { ServerRequest } from '@hermes/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $notifications, clearNotifications } from '@/store/notifications'
 import { $approvalRequests, clearApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import { $routeRequest } from '@/store/recovery-requests'
+import { rememberServerRequest, resetServerRequestsForTests } from '@/store/server-requests'
 
 import { handleInputRequestEvent } from './input-requests'
 import type { GatewayEventContext } from './types'
@@ -38,6 +40,35 @@ function parkApproval() {
 }
 
 describe('approval request.cancel', () => {
+  it.each(['timeout', 'answered', 'interrupted', 'shutdown'])(
+    'dismisses the native toast on backend retirement: %s',
+    reason => {
+      const original = window.hermesDesktop
+      const dismissNotification = vi.fn().mockResolvedValue(true)
+      window.hermesDesktop = { dismissNotification } as unknown as Window['hermesDesktop']
+      vi.useFakeTimers()
+
+      try {
+        parkApproval()
+        rememberServerRequest({
+          id: 'srv-1',
+          method: 'approval',
+          params: {},
+          respond: vi.fn()
+        } as unknown as ServerRequest)
+        vi.advanceTimersByTime(299_999)
+        expect(dismissNotification).not.toHaveBeenCalled()
+        vi.advanceTimersByTime(1)
+        handleInputRequestEvent(context(reason, vi.fn()))
+        expect(dismissNotification).toHaveBeenCalledExactlyOnceWith('srv-1')
+        expect($approvalRequests.get()['s1']).toBeUndefined()
+      } finally {
+        window.hermesDesktop = original
+        resetServerRequestsForTests()
+        vi.useRealTimers()
+      }
+    }
+  )
   afterEach(() => {
     clearApprovalRequest('s1')
     clearNotifications()

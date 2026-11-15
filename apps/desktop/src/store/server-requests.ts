@@ -20,7 +20,12 @@ export function rememberServerRequest(request: ServerRequest): void {
 }
 
 export function forgetServerRequest(id: string): void {
+  const request = open.get(id)
   open.delete(id)
+
+  if (request?.method === 'approval') {
+    void window.hermesDesktop?.dismissNotification?.(id)?.catch(() => undefined)
+  }
 }
 
 /** Answer request `id`. False when nothing is open under that id (expired / already answered). */
@@ -31,8 +36,8 @@ export function respondToServerRequest(id: string | undefined, result: Record<st
     return false
   }
 
-  open.delete(id!)
   request.respond(result)
+  forgetServerRequest(id!)
 
   return true
 }

@@ -22,6 +22,7 @@ export function registerNativeNotifications({
   const deliveries = new Map<string, Promise<boolean>>()
   const linux = platform === 'linux' ? createLinuxNotifications() : undefined
   const notifications = createNotificationRegistry({ releaseOnClose: Boolean(linux) })
+  const pending = new WeakMap<Electron.WebContents, Map<string, () => void>>()
 
   ipcMain.handle('hermes:notify', async (event, payload: HermesNotification) => {
     // The source renderer owns runtime bindings and plugin callbacks.
@@ -35,9 +36,24 @@ export function registerNativeNotifications({
     // Peer renderers share one OS notification for the same event.
     const key = `${payload?.kind ?? ''}:${payload?.sessionId ?? payload?.tag ?? ''}`
 
-    if (isDuplicateNotification(key)) {
+    // Request notifications are owned by one renderer and one exact request;
+    // unrelated requests in the same session must never collapse together.
+    const requestId =
+      payload?.kind === 'approval' && typeof payload.requestId === 'string' ? payload.requestId : undefined
+
+    const owned = pending.get(event.sender) ?? new Map<string, () => void>()
+
+    if (requestId) {
+      if (owned.has(requestId)) {
+        return true
+      }
+
+      pending.set(event.sender, owned)
+    } else if (isDuplicateNotification(key)) {
       return deliveries.get(key) ?? false
     }
+
+    let retired = false
 
     const actions = Array.isArray(payload?.actions) ? payload.actions : []
     const icon = typeof payload?.icon === 'string' && payload.icon.trim() ? payload.icon.trim() : undefined
@@ -47,10 +63,24 @@ export function registerNativeNotifications({
       body: payload?.body || '',
       silent: Boolean(payload?.silent),
       ...(icon ? { icon } : {}),
+      // Blocking work (approvals) and explicit persistent sends (settings test)
+      // stay visible on Windows until acted on instead of banner-timeout hiding.
+      ...(platform === 'win32' && (payload?.kind === 'approval' || payload?.persistent === true)
+        ? { timeoutType: 'never' as const }
+        : {}),
       actions: actions.map(action => ({ type: 'button' as const, text: String(action?.text || '') }))
     }
 
     const notification = linux ? linux.create(options) : new Notification(options)
+
+    if (requestId) {
+      notification.on('show', () =>
+        console.info('[approval-notification]', JSON.stringify({ requestId, outcome: 'native-shown' }))
+      )
+      notification.on('failed', () =>
+        console.warn('[approval-notification]', JSON.stringify({ requestId, outcome: 'native-failed' }))
+      )
+    }
 
     notification.on('click', () => {
       const window = targetWindow()
@@ -76,6 +106,10 @@ export function registerNativeNotifications({
       }
     })
     notification.on('action', (actionEvent, index) => {
+      if (retired) {
+        return
+      }
+
       const window = targetWindow()
 
       if (!window || window.isDestroyed()) {
@@ -94,7 +128,11 @@ export function registerNativeNotifications({
           return
         }
 
-        window.webContents.send('hermes:notification-action', { sessionId: payload.sessionId, actionId: action.id })
+        window.webContents.send('hermes:notification-action', {
+          sessionId: payload.sessionId,
+          actionId: action.id,
+          ...(requestId ? { requestId } : {})
+        })
 
         return
       }
@@ -107,7 +145,33 @@ export function registerNativeNotifications({
         tag: payload?.tag
       })
     })
-    notifications.retain(notification)
+    const dismiss = notifications.retain(notification, { requestOwned: Boolean(requestId) })
+
+    if (requestId) {
+      const clean = () => {
+        retired = true
+        owned.delete(requestId)
+        event.sender.removeListener('destroyed', close)
+        event.sender.removeListener('render-process-gone', close)
+        event.sender.removeListener('did-start-loading', close)
+        notification.removeListener('click', clean)
+        notification.removeListener('action', clean)
+        notification.removeListener('failed', clean)
+      }
+
+      const close = () => {
+        dismiss()
+        clean()
+      }
+
+      owned.set(requestId, close)
+      event.sender.once('destroyed', close)
+      event.sender.once('render-process-gone', close)
+      event.sender.once('did-start-loading', close)
+      notification.once('click', clean)
+      notification.once('action', clean)
+      notification.once('failed', clean)
+    }
 
     // Peers share the actual outcome, including pending/failed Linux delivery.
     const delivery = Promise.resolve(notification.show()).then(result => result !== false)
@@ -119,6 +183,17 @@ export function registerNativeNotifications({
     }, dedupeIntervalMs).unref()
 
     return delivery
+  })
+
+  ipcMain.handle('hermes:notify-dismiss', (event, requestId: unknown) => {
+    if (typeof requestId !== 'string') {
+      return false
+    }
+
+    const dismiss = pending.get(event.sender)?.get(requestId)
+    dismiss?.()
+
+    return Boolean(dismiss)
   })
 
   return { dispose: () => linux?.dispose() }
