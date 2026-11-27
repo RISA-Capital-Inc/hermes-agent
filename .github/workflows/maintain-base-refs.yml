@@ -1,0 +1,33 @@
+name: maintain-base-refs
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  base-refs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure base/<latest-stable> exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          api=https://api.github.com/repos/NousResearch/hermes-agent
+          TAG=$(curl -fsSL "$api/releases?per_page=20" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name')
+          REF=$(curl -fsSL "$api/git/ref/tags/$TAG")
+          SHA=$(jq -r .object.sha <<<"$REF")
+          if [ "$(jq -r .object.type <<<"$REF")" = "tag" ]; then
+            SHA=$(curl -fsSL "$api/git/tags/$SHA" | jq -r .object.sha)
+          fi
+          echo "stable=$TAG commit=$SHA"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/base/$TAG" >/dev/null 2>&1; then
+            echo "base/$TAG already present"
+            exit 0
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/heads/base/$TAG" -f sha="$SHA"
+          echo "created base/$TAG"
