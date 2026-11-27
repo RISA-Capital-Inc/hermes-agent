@@ -333,8 +333,8 @@ export function useDesktopIntegrations({
   }, [locationPathname, navigate, runtimeIdByStoredSessionId])
 
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
-      void respondToApprovalAction(sessionId ?? null, actionId)
+    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId, requestId }) => {
+      void respondToApprovalAction(sessionId ?? null, actionId, requestId)
     })
 
     return () => unsubscribe?.()

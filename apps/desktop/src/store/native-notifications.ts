@@ -190,6 +190,10 @@ export interface NativeNotificationAction {
 }
 
 export interface NativeNotificationInput {
+  /** Exact approval server request; also scopes actions and dismissal. */
+  requestId?: string
+  /** Keep the toast visible until acted on (Windows) -- used by the settings test button. */
+  persistent?: boolean
   kind: NativeNotificationKind
   title: string
   body?: string
@@ -224,39 +228,75 @@ export interface NativeNotificationInput {
  *  must only do so on true, or suppressed/throttled notifications leak it. */
 export function dispatchNativeNotification(input: NativeNotificationInput): boolean {
   const prefs = $nativeNotifyPrefs.get()
+  // Only fresh server requests reach this path with an approval requestId;
+  // replay suppression remains in the server-request handler. A blocking
+  // approval must not disappear merely because another socket reconnects or
+  // its tab happened to be focused when the request arrived.
+  const requestOwnedApproval = input.kind === 'approval' && Boolean(input.requestId)
+
+  const trace = (outcome: string) => {
+    if (input.kind === 'approval') {
+      console.info('[approval-notification]', JSON.stringify({ requestId: input.requestId, outcome }))
+    }
+  }
 
   if (!prefs.enabled || !prefs.kinds[input.kind]) {
+    trace('disabled-by-preferences')
+
     return false
   }
 
-  if (withinNativeNotifyBaseline()) {
+  if (!requestOwnedApproval && withinNativeNotifyBaseline()) {
+    trace('suppressed-by-reconnect-baseline')
+
     return false
   }
 
-  if (!shouldFire(input.kind, input.sessionId, input.global)) {
+  if (!requestOwnedApproval && !shouldFire(input.kind, input.sessionId, input.global)) {
+    trace('suppressed-by-focus')
+
     return false
   }
 
-  if (throttled(`${input.kind}:${input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`, Date.now())) {
+  if (
+    throttled(
+      `${input.kind}:${input.requestId ?? input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`,
+      Date.now()
+    )
+  ) {
     return false
   }
 
   const namedKey = input.sessionId ? NAMED_TITLE_KEYS[input.kind] : undefined
   const title = namedKey && input.sessionId ? withSessionLabel(namedKey, input.sessionId) : input.title
 
-  void window.hermesDesktop?.notify({
-    actions: input.actions,
-    activate: input.activate,
-    body: input.body,
-    focusSessionId: input.sessionId ? (storedSessionIdForRuntimeId(input.sessionId) ?? undefined) : undefined,
-    icon: input.icon,
-    kind: input.kind,
-    notifyId: input.notifyId,
-    sessionId: input.sessionId ?? undefined,
-    silent: input.silent,
-    tag: input.tag,
-    title
-  })
+  const bridge = window.hermesDesktop
+
+  if (!bridge?.notify) {
+    trace('no-native-bridge')
+
+    return false
+  }
+
+  trace('dispatching')
+  void bridge
+    .notify({
+      actions: input.actions,
+      activate: input.activate,
+      body: input.body,
+      focusSessionId: input.sessionId ? (storedSessionIdForRuntimeId(input.sessionId) ?? undefined) : undefined,
+      icon: input.icon,
+      kind: input.kind,
+      notifyId: input.notifyId,
+      persistent: input.persistent,
+      requestId: input.requestId,
+      sessionId: input.sessionId ?? undefined,
+      silent: input.silent,
+      tag: input.tag,
+      title
+    })
+    .then(accepted => trace(accepted ? 'ipc-accepted' : 'ipc-rejected'))
+    .catch(() => trace('ipc-error'))
 
   return true
 }
@@ -384,9 +424,18 @@ export function dispatchPluginNativeNotification(pluginId: string, input: Plugin
 
 // Resolve a pending approval from a notification button, mirroring the in-app
 // Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  explicitRequestId?: string
+): Promise<void> {
   const [action, ...idParts] = actionId.split(':')
-  const requestId = idParts.length ? idParts.join(':') : sessionApprovalRequest(sessionId).get()?.requestId
+  // The approval QUEUE id (what approval.pending / approval.received /
+  // approval.respond key on) when the action embeds it; `explicitRequestId` is
+  // the notification's own server-request frame identity (live ack path).
+  const queueId = idParts.length ? idParts.join(':') : undefined
+  const frameId = explicitRequestId
+
   const choice = action === 'approve' ? 'once' : action === 'reject' ? 'deny' : null
 
   if (!choice) {
@@ -404,14 +453,29 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
+    // Match by frame identity (live prompts) or by queue id (restored entries):
+    // a toast action carries both, a legacy/in-app action only the queue id.
     const parked = sessionApprovalRequests(sessionId)
       .get()
-      .find(request => request.requestId === requestId)
+      .find(request => (frameId && request.serverRequestId === frameId) || (queueId && request.requestId === queueId))
 
-    await answerApproval(gateway, parked ?? { sessionId, requestId }, choice)
+    // A native action whose toast outlived its request must never answer a newer
+    // approval parked in the same session: compare against the parked request's
+    // backend identity (serverRequestId), not the toast's own id.
+    const liveParked = sessionApprovalRequest(sessionId).get()
 
-    if (requestId || sessionApprovalRequest(sessionId).get()?.requestId === undefined) {
-      clearApprovalRequest(sessionId, requestId)
+    if (frameId && liveParked?.serverRequestId && liveParked.serverRequestId !== frameId) {
+      console.info('[approval-notification]', JSON.stringify({ frameId, outcome: 'action-stale-dropped', queueId }))
+
+      return
+    }
+
+    await answerApproval(gateway, parked ?? { requestId: queueId, serverRequestId: frameId, sessionId }, choice)
+
+    const clearedId = parked?.requestId ?? queueId
+
+    if (clearedId || sessionApprovalRequest(sessionId).get()?.requestId === undefined) {
+      clearApprovalRequest(sessionId, clearedId)
     }
 
     void replayPendingApproval(gateway, sessionId).catch(() => undefined)
@@ -434,7 +498,16 @@ export async function sendTestNativeNotification(title: string, body: string): P
   }
 
   try {
-    return await bridge.notify({ body, kind: 'turnDone', title })
+    // Unique tag + persistent: repeated presses stack as separate toasts (no dedupe
+    // collapse, no replacement) and stay visible on Windows until dismissed, so the
+    // button demonstrates what a pile of pending requests actually looks like.
+    return await bridge.notify({
+      body,
+      kind: 'turnDone',
+      persistent: true,
+      tag: `test-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      title
+    })
   } catch {
     return false
   }
