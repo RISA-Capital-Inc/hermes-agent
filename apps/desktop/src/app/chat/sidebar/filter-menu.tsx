@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { useI18n } from '@/i18n'
 import { desktopGit } from '@/lib/desktop-git'
+import { normalizeOwner, UNATTRIBUTED_OWNER } from '@/lib/session-owner'
 import { cn } from '@/lib/utils'
 import { $showsAdvancedChrome } from '@/store/interface-mode'
 import {
@@ -28,6 +29,7 @@ import {
   $sidebarGrouping,
   $sidebarListGroupIds,
   $sidebarOrdering,
+  $sidebarOwnerFilter,
   $sidebarPrFilter,
   $sidebarProfileFilter,
   $sidebarProjectFilter,
@@ -48,6 +50,7 @@ import {
   type SidebarGrouping,
   type SidebarOrdering,
   type SidebarRowMeta,
+  toggleSidebarOwnerFilter,
   toggleSidebarPrFilter,
   toggleSidebarProfileFilter,
   toggleSidebarProjectFilter,
@@ -65,7 +68,7 @@ import { $profileRailVisible, toggleProfileRailVisible } from '@/store/profile-r
 import { runImportProfileFlow } from '@/store/profile-share'
 import { $projectTree } from '@/store/projects'
 import type { PullRequestBucket } from '@/store/pull-requests'
-import { $unreadFinishedSessionIds, markAllSessionsRead } from '@/store/session'
+import { $sessions, $unreadFinishedSessionIds, markAllSessionsRead } from '@/store/session'
 import type { SessionStatusBucket } from '@/store/session-dot-state'
 import { $sessionsHaveCost } from '@/store/sidebar-archive'
 
@@ -119,6 +122,9 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
 
   const GROUPING_OPTIONS: Record<SidebarGrouping, Omit<Option<SidebarGrouping>, 'id'>> = {
     date: { icon: 'clock', label: f.updated },
+    // No i18n key yet: the Owner dimension is new, and en.ts is a 272 KB
+    // whole-file write. Literal label here is a maintainer follow-up.
+    owner: { icon: 'account', label: 'Owner' },
     profile: { icon: 'account', label: f.profile },
     project: { icon: 'root-folder', label: f.project },
     status: { icon: 'pulse', label: f.status }
@@ -169,9 +175,19 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
   const statusFilter = useStore($sidebarStatusFilter)
   const projectFilter = useStore($sidebarProjectFilter)
   const profileFilter = useStore($sidebarProfileFilter)
+  const ownerFilter = useStore($sidebarOwnerFilter)
   const showAllProfiles = useStore($showAllProfiles)
   const profileNames = useStore($profiles).map(profile => normalizeProfileKey(profile.name))
   const narrowsByProfile = showAllProfiles && profileNames.length > 1
+  // One checkbox per login actually present in the loaded rows; `Unattributed`
+  // is a bucket of its own and sorts last. A single-owner list has nothing to
+  // narrow, so the submenu hides rather than offering one dead checkbox.
+  const ownerNames = [
+    ...new Set(useStore($sessions).map(session => normalizeOwner(session.user_id)))
+  ].sort((a, b) =>
+    a === UNATTRIBUTED_OWNER ? 1 : b === UNATTRIBUTED_OWNER ? -1 : a.localeCompare(b)
+  )
+  const narrowsByOwner = ownerNames.length > 1
   const prFilter = useStore($sidebarPrFilter)
   const showArchived = useStore($sidebarShowArchived)
   const filtersActive = useStore($sidebarFiltersActive)
@@ -394,6 +410,25 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
               </DropdownMenuItem>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+
+          {/* Login, not profile: two people sharing one profile land in the
+              same Profile bucket but different Owner buckets. Hidden when only
+              one login is loaded, since there is nothing to narrow. */}
+          {narrowsByOwner && (
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>Owner</DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
+                {ownerNames.map(name => (
+                  <OptionCheckbox
+                    checked={ownerFilter.includes(name)}
+                    key={name}
+                    onCheck={() => toggleSidebarOwnerFilter(name)}
+                    option={{ icon: 'account', id: name, label: name }}
+                  />
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          )}
 
           {projects.length > 1 && (
             <DropdownMenuSub>
