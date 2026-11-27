@@ -3,6 +3,10 @@ export interface HermesNotification {
   body?: string
   silent?: boolean
   kind?: string
+  /** Exact live server request owning an approval notification. */
+  requestId?: string
+  /** Keep the toast visible until acted on (Windows `timeoutType: never`): approvals, and explicit sends like the settings test button. */
+  persistent?: boolean
   sessionId?: string
   /** Durable click target captured before runtime bindings can be recycled. */
   focusSessionId?: string

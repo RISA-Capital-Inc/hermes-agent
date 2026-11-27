@@ -391,6 +391,11 @@ const approval: Handler = ctx => {
   }).catch(() => undefined)
   markNeedsInput(ctx)
 
+  console.info(
+    '[approval-notification]',
+    JSON.stringify({ requestId: request.id, outcome: request.replayed ? 'replayed-no-alert' : 'new-request' })
+  )
+
   if (!request.replayed) {
     dispatchNativeNotification({
       actions: [
@@ -405,6 +410,7 @@ const approval: Handler = ctx => {
       ],
       body: command || description,
       kind: 'approval',
+      requestId: request.id,
       sessionId: sessionId || null,
       title: translateNow('notifications.native.approvalTitle')
     })
