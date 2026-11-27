@@ -119,6 +119,27 @@ describe('dispatchNativeNotification focus gating', () => {
     expect(notify).toHaveBeenCalledTimes(1)
   })
 
+  it('notifies a fresh approval even when its session is focused', () => {
+    const sessionId = freshSession()
+    setWindowState({ focused: true, hidden: false })
+    setActiveSessionId(sessionId)
+    dispatchNativeNotification({ kind: 'approval', requestId: 'focused-approval', sessionId, title: 'approve' })
+    expect(notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not lose a fresh background approval during another gateway reconnect', () => {
+    setWindowState({ focused: true, hidden: false })
+    setActiveSessionId(freshSession())
+    markNativeNotifyBaseline()
+    dispatchNativeNotification({
+      kind: 'approval',
+      requestId: 'new-during-reconnect',
+      sessionId: freshSession(),
+      title: 'approve'
+    })
+    expect(notify).toHaveBeenCalledTimes(1)
+  })
+
   it('suppresses an attention notification for the active session when focused', () => {
     setWindowState({ focused: true, hidden: false })
     setActiveSessionId('on-screen')
@@ -298,6 +319,19 @@ describe('sendTestNativeNotification', () => {
     sendTestNativeNotification('Hermes', 'works')
     expect(notify).toHaveBeenCalledTimes(1)
   })
+
+  it('stacks: every press sends a unique tag and a persistent toast', () => {
+    sendTestNativeNotification('Hermes', 'one')
+    sendTestNativeNotification('Hermes', 'two')
+    expect(notify).toHaveBeenCalledTimes(2)
+    const first = notify.mock.calls[0]?.[0] as { persistent?: boolean; tag?: string }
+    const second = notify.mock.calls[1]?.[0] as { persistent?: boolean; tag?: string }
+    expect(first?.persistent).toBe(true)
+    expect(second?.persistent).toBe(true)
+    expect(first?.tag).toMatch(/^test-/)
+    expect(second?.tag).toMatch(/^test-/)
+    expect(first?.tag).not.toBe(second?.tag)
+  })
 })
 
 describe('respondToApprovalAction', () => {
@@ -360,6 +394,40 @@ describe('respondToApprovalAction', () => {
       APPROVAL_RESPOND_REQUEST_TIMEOUT_MS,
       undefined
     )
+  })
+
+  it('never applies an old notification action to a newer approval in the same session', async () => {
+    setApprovalRequest({ command: 'new command', description: '', sessionId: 'bg', serverRequestId: 'new-request' })
+    await respondToApprovalAction('bg', 'approve', 'old-request')
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('lands a toast action: the queue id travels as request_id, the frame id resolves the parked request', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'deploy', description: '', requestId: 'q-1', serverRequestId: 'srv-1', sessionId: 'bg' })
+    await respondToApprovalAction('bg', 'approve:q-1', 'srv-1')
+    expect(request).toHaveBeenCalledWith(
+      'approval.respond',
+      { all: false, choice: 'once', request_id: 'q-1', session_id: 'bg' },
+      // #55433: the respond RPC carries an explicit deadline covering the backend's approvals window.
+      APPROVAL_RESPOND_REQUEST_TIMEOUT_MS,
+      undefined
+    )
+    expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('resolves by frame id when the action id carries no queue part', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'deploy', description: '', requestId: 'q-9', serverRequestId: 'srv-9', sessionId: 'bg' })
+    await respondToApprovalAction('bg', 'approve', 'srv-9')
+    expect(request).toHaveBeenCalledWith(
+      'approval.respond',
+      { all: false, choice: 'once', request_id: 'q-9', session_id: 'bg' },
+      // #55433: the respond RPC carries an explicit deadline covering the backend's approvals window.
+      APPROVAL_RESPOND_REQUEST_TIMEOUT_MS,
+      undefined
+    )
+    expect($approvalRequest.get()).toBeNull()
   })
 
   it('ignores unknown action ids', async () => {

@@ -6,9 +6,12 @@ import { group } from '@/components/pane-shell/tree/model'
 import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { runTour } from '@/lib/tour'
+import { setNativeNotifyEnabled, setNativeNotifyKind } from '@/store/native-notifications'
+import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { $previewTabs, closeRightRail, openPreview, setPreviewTabPinned } from '@/store/preview'
+import { clearApprovalRequest } from '@/store/prompts'
 import { hasOpenServerRequest, resetServerRequestsForTests } from '@/store/server-requests'
-import { setActiveSessionId, setSelectedStoredSessionId, setSessions } from '@/store/session'
+import { $activeSessionId, setActiveSessionId, setSelectedStoredSessionId, setSessions } from '@/store/session'
 import { $sessionStates, $sessionTiles, dropSessionState, publishSessionState } from '@/store/session-states'
 import { $toursEnabled } from '@/store/tours'
 import type { SessionInfo } from '@/types/hermes'
@@ -55,6 +58,59 @@ function deliver(method: string, params: Record<string, unknown>, activeSessionI
 
   return { decline, fail, handled, respond }
 }
+
+describe('approval notification routing', () => {
+  it('delivers a new background-tab approval through the native bridge during reconnect, but not its replay', () => {
+    const original = window.hermesDesktop
+    const previousSession = $activeSessionId.get()
+    const notify = vi.fn().mockResolvedValue(true)
+    window.hermesDesktop = { notify } as unknown as Window['hermesDesktop']
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    setNativeNotifyEnabled(true)
+    setNativeNotifyKind('approval', true)
+    $activeSessionId.set('viewed-tab')
+    markNativeNotifyBaseline()
+
+    const request = {
+      id: 'fresh-background-approval',
+      method: 'approval',
+      profile: 'default',
+      params: {
+        session_id: 'other-tab',
+        request_id: 'queue-entry',
+        command: 'synthetic command',
+        description: 'test only'
+      },
+      respond: vi.fn(),
+      fail: vi.fn()
+    }
+
+    try {
+      expect(handleServerRequest(request, deps, 'viewed-tab')).toBe(true)
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          kind: 'approval',
+          requestId: request.id,
+          sessionId: 'other-tab',
+          actions: [
+            expect.objectContaining({ id: 'approve:queue-entry' }),
+            expect.objectContaining({ id: 'reject:queue-entry' })
+          ]
+        })
+      )
+      handleServerRequest({ ...request, replayed: true }, deps, 'viewed-tab')
+      expect(notify).toHaveBeenCalledTimes(1)
+    } finally {
+      window.hermesDesktop = original
+      $activeSessionId.set(previousSession)
+      clearApprovalRequest('other-tab')
+      resetServerRequestsForTests()
+      __resetNativeNotifyBaselineForTests()
+      vi.restoreAllMocks()
+    }
+  })
+})
 
 describe('connection request routing', () => {
   it('does not route connection operations through the server-request rail', () => {
